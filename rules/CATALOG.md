@@ -1,5 +1,7 @@
 # Catálogo de regras de limpeza do Atlas
 
+**English:** [Rules catalog](CATALOG.en.md)
+
 > Gerado automaticamente a partir dos arquivos JSON de regras. Não edite este arquivo manualmente.
 >
 > Para gerar novamente: `npm run catalog`

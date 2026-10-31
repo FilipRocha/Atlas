@@ -1,5 +1,7 @@
 # Avisos de componentes do coletor de hardware
 
+**English:** [Third-party hardware collector notices](THIRD-PARTY-NOTICES-LIBREHARDWAREMONITOR.en.md)
+
 O pacote do Windows inclui o coletor `LibreHardwareMonitorBridge`. Ele usa `LibreHardwareMonitorLib` e suas dependências transitivas para consultar sensores. Os nomes, versões e licenças abaixo correspondem ao `project.assets.json` do projeto .NET; atualize esta lista quando as dependências mudarem.
 
 | Componente | Versão | Licença indicada | Fonte |

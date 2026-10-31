@@ -1,5 +1,7 @@
 # Histórico de alterações — Atlas
 
+**English:** [Changelog](CHANGELOG.en.md)
+
 Este arquivo resume mudanças relevantes do projeto. A versão publicada está definida em `package.json`.
 
 ## 3.4.0

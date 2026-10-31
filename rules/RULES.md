@@ -1,5 +1,7 @@
 # Contribuir com regras de limpeza
 
+**English:** [Cleaning rules contribution guide](RULES.en.md)
+
 As regras de limpeza do Atlas são arquivos JSON separados por sistema operacional. Você pode acrescentar ou corrigir uma regra sem alterar a interface do aplicativo.
 
 ## Estrutura

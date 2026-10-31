@@ -1,5 +1,7 @@
 # Orientações para trabalhar no Atlas
 
+**English:** [Atlas development guide](CLAUDE.en.md)
+
 O Atlas é um aplicativo de manutenção feito com Electron, React e TypeScript. Preserve o comportamento existente e consulte os arquivos próximos à mudança antes de editar.
 
 ## Desenvolvimento

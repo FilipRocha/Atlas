@@ -1,5 +1,7 @@
 # Testes e relatórios de QA
 
+**English:** [Testing and QA reports](TESTING.en.md)
+
 O projeto oferece verificações rápidas de código e uma verificação de inicialização do aplicativo.
 
 ## Dependências

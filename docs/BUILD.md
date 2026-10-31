@@ -1,5 +1,7 @@
 # Compilação e distribuição
 
+**English:** [Build and distribution](BUILD.en.md)
+
 Este guia cobre a preparação do ambiente, o desenvolvimento e a criação dos pacotes do Atlas.
 
 ## Requisitos

@@ -1,5 +1,7 @@
 # Linha de comando
 
+**English:** [Command-line guide](CLI.en.md)
+
 O Atlas pode executar tarefas pelo terminal sem abrir a janela. A disponibilidade dos comandos varia conforme o sistema operacional; algumas ações do Windows exigem privilégios de administrador.
 
 ```text

@@ -1,5 +1,7 @@
 # Monitoramento de hardware
 
+**English:** [Hardware monitoring](HARDWARE-MONITORING.en.md)
+
 A tela **Monitor de Desempenho** e o **Monitor sobreposto** recebem os dados do mesmo serviço do Atlas. Quando uma leitura não está disponível, o aplicativo deixa o valor indisponível em vez de inventá-lo.
 
 ## Fontes de dados

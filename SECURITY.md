@@ -1,5 +1,7 @@
 # Segurança
 
+**English:** [Security](SECURITY.en.md)
+
 O Atlas inclui ferramentas que podem remover arquivos ou alterar configurações do sistema. Este documento resume os cuidados para usar e desenvolver o aplicativo.
 
 ## Uso do aplicativo
