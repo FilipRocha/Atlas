@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Kilépés",
+  "scheduledTaskNotificationTitle": "Atlas - Ütemezett feladat",
+  "scheduledTaskNotificationBody": "\\\"{{name}}\\\" futtatása...",
+  "scanCompleteNotificationTitle": "Atlas - Vizsgálat befejezve",
+  "scanCompleteNotificationBody": "{{itemCount}} tisztítható elem található ({{sizeMB}} MB).",
+  "scheduledScanName": "Ütemezett vizsgálat",
+  "openAtlas": "Atlas megnyitása"
+}

@@ -1,0 +1,68 @@
+# Weekly grouped dependency updates, opened Tuesday mornings: one PR per
+# ecosystem for minor/patch bumps and one for majors. Security advisories bypass
+# the schedule and open immediately. Dependabot must be enabled in the repo's
+# Settings > Code security for this file to take effect.
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "07:00"
+      timezone: Africa/Johannesburg
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore(deps)
+      prefix-development: chore(deps-dev)
+    groups:
+      electron:
+        patterns:
+          - electron
+          - electron-builder
+          - electron-vite
+          - electron-updater
+      react:
+        patterns:
+          - react
+          - react-dom
+          - react-router-dom
+          - "@types/react*"
+      dev-tools:
+        patterns:
+          - typescript
+          - vite
+          - vitest
+          - tailwindcss
+          - "@tailwindcss/*"
+          - "@vitejs/*"
+      npm-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      npm-major:
+        patterns:
+          - "*"
+        update-types:
+          - major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "07:00"
+      timezone: Africa/Johannesburg
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -1,0 +1,125 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { IPC } from '../../shared/channels'
+
+const handlers = new Map<string, (...args: unknown[]) => unknown>()
+
+const mocks = vi.hoisted(() => ({
+  mkdir: vi.fn(async () => undefined),
+  openPath: vi.fn(async () => ''),
+  showItemInFolder: vi.fn(),
+  resolveBackupFile: vi.fn(),
+  backupDir: 'C:/atlas-test/Atlas Backups',
+  readdir: vi.fn(),
+  lstat: vi.fn()
+}))
+
+vi.mock('electron', () => ({
+  dialog: { showSaveDialog: vi.fn() },
+  ipcMain: {
+    handle: (channel: string, fn: (...args: unknown[]) => unknown) => {
+      handlers.set(channel, fn)
+    }
+  },
+  shell: { openPath: mocks.openPath, showItemInFolder: mocks.showItemInFolder }
+}))
+
+vi.mock('fs/promises', () => ({
+  mkdir: mocks.mkdir,
+  readdir: mocks.readdir,
+  lstat: mocks.lstat,
+  writeFile: vi.fn()
+}))
+
+vi.mock('../services/backup-dir', () => ({ getBackupDir: () => mocks.backupDir }))
+vi.mock('../services/recovery-store', () => ({
+  listRecoveryEntries: vi.fn(),
+  listRecoveryPage: vi.fn(async () => ({ entries: [], hasMore: false })),
+  removeRecoveryEntry: vi.fn()
+}))
+vi.mock('../services/recovery', () => ({ restoreRecoveryEntry: vi.fn() }))
+vi.mock('../services/registry-backups', () => ({
+  listRegistryBackups: vi.fn(),
+  resolveBackupFile: mocks.resolveBackupFile,
+  restoreRegistryBackup: vi.fn()
+}))
+vi.mock('./game-mode.ipc', () => ({ getGameModeStatus: vi.fn() }))
+
+import { registerRecoveryIpc } from './recovery.ipc'
+
+describe('RECOVERY_OPEN_BACKUPS', () => {
+  beforeEach(() => {
+    handlers.clear()
+    mocks.mkdir.mockClear()
+    mocks.openPath.mockClear()
+    mocks.openPath.mockResolvedValue('')
+    registerRecoveryIpc()
+  })
+
+  it('creates the backup folder before opening it', async () => {
+    await handlers.get(IPC.RECOVERY_OPEN_BACKUPS)!({})
+
+    expect(mocks.mkdir).toHaveBeenCalledWith(mocks.backupDir, { recursive: true })
+    expect(mocks.openPath).toHaveBeenCalledWith(mocks.backupDir)
+    expect(mocks.mkdir.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.openPath.mock.invocationCallOrder[0]
+    )
+  })
+
+  it('surfaces a non-empty openPath result as an error', async () => {
+    mocks.openPath.mockResolvedValue('No application found')
+
+    await expect(handlers.get(IPC.RECOVERY_OPEN_BACKUPS)!({})).rejects.toThrow(
+      'No application found'
+    )
+  })
+})
+
+describe('RECOVERY_LIST backups', () => {
+  beforeEach(() => {
+    handlers.clear()
+    registerRecoveryIpc()
+  })
+
+  it('lists registry cleaner and privacy-trace backups, and nothing else', async () => {
+    const file = (name: string) => ({ name, isFile: () => true })
+    mocks.readdir.mockResolvedValue([
+      file('registry-backup-targeted-2026-09-25T00-00-00-000Z.reg'),
+      file('privacy-traces-backup-RunMRU-2026-09-25T00-00-00-000Z.reg'),
+      file('notes.txt'),
+      file('other-backup.reg')
+    ])
+    mocks.lstat.mockResolvedValue({
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      size: 10,
+      mtime: new Date(0)
+    })
+    const result = (await handlers.get(IPC.RECOVERY_LIST)!({}, 0)) as {
+      backups: Array<{ name: string }>
+    }
+    expect(result.backups.map((b) => b.name)).toEqual([
+      'registry-backup-targeted-2026-09-25T00-00-00-000Z.reg',
+      'privacy-traces-backup-RunMRU-2026-09-25T00-00-00-000Z.reg'
+    ])
+  })
+})
+
+describe('RECOVERY_SHOW_BACKUP', () => {
+  beforeEach(() => {
+    handlers.clear()
+    mocks.showItemInFolder.mockClear()
+    mocks.resolveBackupFile.mockReset()
+    registerRecoveryIpc()
+  })
+
+  it('reveals only a backup that resolves inside the backup folder', async () => {
+    mocks.resolveBackupFile.mockResolvedValue({ dir: mocks.backupDir, path: 'C:/real/file.reg' })
+    await handlers.get(IPC.RECOVERY_SHOW_BACKUP)!({}, 'registry-backup-x.reg')
+    expect(mocks.resolveBackupFile).toHaveBeenCalledWith('registry-backup-x.reg')
+    expect(mocks.showItemInFolder).toHaveBeenCalledWith('C:/real/file.reg')
+
+    mocks.resolveBackupFile.mockRejectedValue(new Error('Invalid backup name'))
+    await expect(handlers.get(IPC.RECOVERY_SHOW_BACKUP)!({}, '../x.reg')).rejects.toThrow()
+    expect(mocks.showItemInFolder).toHaveBeenCalledTimes(1)
+  })
+})

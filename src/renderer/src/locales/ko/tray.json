@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "종료",
+  "scheduledTaskNotificationTitle": "Atlas - 예약된 작업",
+  "scheduledTaskNotificationBody": "\\\"{{name}}\\\" 실행 중...",
+  "scanCompleteNotificationTitle": "Atlas - 검사 완료",
+  "scanCompleteNotificationBody": "정리할 수 있는 항목 {{itemCount}}개({{sizeMB}} MB)를 찾았습니다.",
+  "scheduledScanName": "예약된 검사",
+  "openAtlas": "Atlas 열기"
+}

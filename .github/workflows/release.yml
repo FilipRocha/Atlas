@@ -1,0 +1,231 @@
+name: Release - Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing unpublished release tag to rebuild with this workflow
+        required: true
+        type: string
+      artifact_run_id:
+        description: Optional completed release run whose successful platform builds should be reused
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+# A newer run must never interrupt signing or publication of this tag.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate Release
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ inputs.tag || github.sha }}
+
+  package-smoke:
+    name: Verify Packaging
+    uses: ./.github/workflows/package-smoke.yml
+    with:
+      ref: ${{ inputs.tag || github.sha }}
+
+  create-release:
+    name: Prepare Draft Release
+    needs: [validate, package-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Verify tag and prepare draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ env.RELEASE_TAG }}
+        run: node scripts/prepare-release.js
+
+  build:
+    name: Build and Sign (${{ matrix.os }})
+    needs: create-release
+    if: ${{ !inputs.artifact_run_id }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            build-args: --win
+          - os: macos-latest
+            build-args: --mac
+          # Explicit targets prevent the config's target.arch lists from adding
+          # the other architecture despite --x64/--arm64. Keep builds native.
+          - os: ubuntu-latest
+            build-args: --linux AppImage deb --x64
+          - os: ubuntu-24.04-arm
+            build-args: --linux AppImage deb --arm64
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.sha }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Fetch verified WinGet bundle
+        if: runner.os == 'Windows'
+        run: npm run fetch:winget-bundle
+
+      - name: Build Windows hardware bridge and process monitor
+        if: runner.os == 'Windows'
+        run: |
+          npm run build:hardware-bridge
+          npm run build:process-monitor
+
+      - name: Azure login (Windows signing)
+        if: runner.os == 'Windows'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          allow-no-subscriptions: true
+
+      - name: Package and sign without publishing
+        shell: bash
+        env:
+          AZURE_TENANT_ID: ${{ runner.os == 'Windows' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_CLIENT_ID: ${{ runner.os == 'Windows' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ runner.os == 'Windows' && secrets.AZURE_CLIENT_SECRET || '' }}
+          CSC_LINK: ${{ runner.os == 'macOS' && secrets.MAC_CERTIFICATE_P12 || '' }}
+          CSC_KEY_PASSWORD: ${{ runner.os == 'macOS' && secrets.MAC_CERTIFICATE_PASSWORD || '' }}
+          APPLE_ID: ${{ runner.os == 'macOS' && secrets.APPLE_ID || '' }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ runner.os == 'macOS' && secrets.APPLE_APP_SPECIFIC_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ runner.os == 'macOS' && secrets.APPLE_TEAM_ID || '' }}
+          DEBUG: ${{ runner.os == 'macOS' && 'electron-notarize*' || '' }}
+        timeout-minutes: 30
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            npx electron-builder ${{ matrix.build-args }} --publish never \
+              -c.win.azureSignOptions.endpoint="https://eus.codesigning.azure.net" \
+              -c.win.azureSignOptions.codeSigningAccountName="atlas-signing" \
+              -c.win.azureSignOptions.certificateProfileName="atlas-sign" \
+              -c.win.azureSignOptions.publisherName="Advent Development, Inc."
+          else
+            npx electron-builder ${{ matrix.build-args }} --publish never
+          fi
+
+      - name: Store release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ matrix.os }}
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.blockmap
+            dist/latest*.yml
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+          overwrite: true
+
+  publish-release:
+    name: Verify and Publish Release
+    needs: [create-release, build]
+    if: ${{ !cancelled() && needs.create-release.result == 'success' && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.artifact_run_id != '')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Recovery must use the fixed publishing tools from the workflow commit;
+      # the installers themselves always come from the validated release tag.
+      - name: Checkout publication tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install verification dependencies
+        run: npm ci --ignore-scripts
+      - name: Verify source run before reusing artifacts
+        if: ${{ inputs.artifact_run_id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_RUN_ID: ${{ inputs.artifact_run_id }}
+        run: node scripts/verify-release-run.js
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+          pattern: release-*
+          path: release-artifacts
+          # Keep platform directories separate so duplicate filenames fail
+          # verification instead of silently overwriting another architecture.
+          merge-multiple: false
+      - name: Verify artifacts and manifests, upload, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ env.RELEASE_TAG }}
+        run: node scripts/publish-release.js release-artifacts
+
+  distribute:
+    name: Distribute Published Release
+    needs: publish-release
+    # Reused builds are intentionally skipped; do not let that transitive skip
+    # suppress distribution after publication has succeeded.
+    if: ${{ !cancelled() && needs.publish-release.result == 'success' }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/distribute-release.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets:
+      WEB_DEPLOY_HOOK: ${{ secrets.WEB_DEPLOY_HOOK }}
+      VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+      WINGET_GH_TOKEN: ${{ secrets.WINGET_GH_TOKEN }}

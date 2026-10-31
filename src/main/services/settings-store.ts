@@ -1,0 +1,507 @@
+import { scheduleDefinition } from '../../shared/schedule-policy'
+import { readFileSync, writeFileSync, renameSync, unlinkSync, mkdirSync, existsSync } from 'fs'
+import { join } from 'path'
+import { app } from 'electron'
+import { randomUUID } from 'crypto'
+import { logError } from './logger'
+import { matchLocaleToLanguage } from '../../shared/languages'
+import type {
+  AtlasSettings,
+  ScheduleEntry,
+  ScheduleTaskType,
+  MalwareAllowlistEntry,
+  WindowsPackageManager,
+  WindowState
+} from '../../shared/types'
+
+let _dataDir: string | null = null
+let _configPath: string | null = null
+
+export function getDataDir(): string {
+  if (!_dataDir) {
+    _dataDir = app.isPackaged ? app.getPath('userData') : join(app.getPath('userData'), 'Atlas-Dev')
+  }
+  return _dataDir
+}
+
+function getConfigPath(): string {
+  if (!_configPath) {
+    _configPath = join(getDataDir(), 'config.json')
+  }
+  return _configPath
+}
+
+interface StoreData {
+  settings: AtlasSettings
+  onboardingComplete: boolean
+  machineId: string
+  /** Last known main-window geometry; null until the window is first sized. */
+  windowState: WindowState | null
+}
+
+const defaults: StoreData = {
+  machineId: '',
+  onboardingComplete: false,
+  windowState: null,
+  settings: {
+    theme: 'system' as const,
+    dashboardView: 'simple',
+    language: 'en',
+    minimizeToTray: false,
+    showNotificationOnComplete: true,
+    showThreatNotifications: true,
+    runAtStartup: false,
+    autoUpdate: true,
+    autoRestart: true,
+    updateCheckIntervalHours: 4,
+    softwareUpdaterNotifications: true,
+    scheduleNudgeDismissed: false,
+    preferElevatedLaunch: false,
+    cleaner: {
+      skipRecentMinutes: 60,
+      secureDelete: false,
+      closeBrowsersBeforeClean: false,
+      createRestorePoint: false,
+      protectRecycleBin: true,
+      keepDeletionLog: false
+    },
+    exclusions: [],
+    ignoredSoftwareUpdates: [],
+    ignoredDriverUpdates: [],
+    backupPath: '',
+    backupMode: 'targeted' as const,
+    schedule: {
+      enabled: false,
+      frequency: 'weekly',
+      day: 1,
+      hour: 9
+    },
+    schedules: [],
+    windowsPackageManager: 'winget' as const,
+    windowsPackageManagers: ['winget', 'choco', 'scoop', 'npm'] as WindowsPackageManager[],
+    gameMode: {
+      enabledOptimizations: [
+        'svc-wsearch',
+        'svc-sysmain',
+        'proc-kill-updaters',
+        'mem-clear-standby',
+        'sys-focus-assist',
+        'sys-power-plan',
+        'sys-prevent-sleep',
+        'sys-disable-game-bar',
+        'sys-disable-fse-opt',
+        'net-flush-dns'
+      ],
+      customProcessKillList: [],
+      autoDetect: false,
+      autoDeactivate: true,
+      customGameProcesses: []
+    },
+    registryIgnoredTweaks: [],
+    malwareAllowlist: []
+  }
+}
+
+function ensureDir(): void {
+  if (!existsSync(getDataDir())) {
+    mkdirSync(getDataDir(), { recursive: true })
+  }
+}
+
+let _systemLanguage: string | null = null
+
+/**
+ * The UI language a fresh install should start in, derived from the OS locale.
+ *
+ * Without this every install opened in English regardless of the system
+ * language, and the 29 shipped translations were only reachable by finding the
+ * picker — which reads as "this app has no translation for my language".
+ *
+ * Only ever consulted when there is no persisted choice: `readStore()` applies
+ * it to the defaults, and any language the user (or the onboarding wizard)
+ * saves takes precedence from then on.
+ */
+export function resolveSystemLanguage(): string {
+  if (_systemLanguage) return _systemLanguage
+  let locale = ''
+  try {
+    // Guarded: `getLocale` is absent from the electron stub some unit tests
+    // mock, and throws if called before the app is ready.
+    if (typeof app?.getLocale === 'function') locale = app.getLocale()
+  } catch {
+    locale = ''
+  }
+  _systemLanguage = matchLocaleToLanguage(locale)
+  return _systemLanguage
+}
+
+/** Deep merge that handles nested objects like cleaner and schedule */
+export function deepMerge<T extends Record<string, any>>(target: T, source: Partial<T>): T {
+  const result = { ...target }
+  for (const key of Object.keys(source) as Array<keyof T>) {
+    // Guard against prototype pollution
+    if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue
+    const srcVal = source[key]
+    const tgtVal = target[key]
+    if (
+      srcVal !== null &&
+      typeof srcVal === 'object' &&
+      !Array.isArray(srcVal) &&
+      tgtVal !== null &&
+      typeof tgtVal === 'object' &&
+      !Array.isArray(tgtVal)
+    ) {
+      result[key] = deepMerge(tgtVal, srcVal as any)
+    } else if (srcVal !== undefined) {
+      result[key] = srcVal as T[keyof T]
+    }
+  }
+  return result
+}
+
+function readStore(): StoreData {
+  ensureDir()
+  try {
+    if (existsSync(getConfigPath())) {
+      const raw = readFileSync(getConfigPath(), 'utf-8')
+      const parsed = JSON.parse(raw)
+      const merged = deepMerge(defaults, parsed)
+      // Drop the legacy `stats` block. Nothing has ever read it — the counters
+      // the UI shows are derived from history.json — so it sat at zero in
+      // config.json while the dashboard reported real numbers, which reads as
+      // data loss to anyone who opens the file (issue #269). Deleting it here
+      // clears it from existing installs on their next write.
+      delete (merged as { stats?: unknown }).stats
+      // Migrate legacy single-manager preference → aggregation list. Existing
+      // installs kept exactly one manager (winget or choco); preserve that as
+      // their scanned set so an upgrade doesn't silently start scanning every
+      // manager. Fresh installs (no persisted legacy value) get the
+      // aggregate-all default. Only runs when the new field was never persisted.
+      if (
+        parsed?.settings &&
+        parsed.settings.windowsPackageManagers === undefined &&
+        (parsed.settings.windowsPackageManager === 'winget' ||
+          parsed.settings.windowsPackageManager === 'choco')
+      ) {
+        merged.settings.windowsPackageManagers = [parsed.settings.windowsPackageManager]
+        // Best-effort: the migration is recomputed on the next read if it fails.
+        try {
+          writeStore(merged)
+        } catch (err) {
+          logError('Package-manager migration write failed', err)
+        }
+      }
+      // Migrate legacy single schedule → schedules array
+      if (merged.settings.schedule.enabled && merged.settings.schedules.length === 0) {
+        const allCleanerTasks: ScheduleTaskType[] = [
+          'cleaner:system',
+          'cleaner:browsers',
+          'cleaner:apps',
+          'cleaner:gaming',
+          'cleaner:recycleBin',
+          'cleaner:databases'
+        ]
+        const migrated: ScheduleEntry = {
+          id: randomUUID(),
+          name: 'Scheduled Scan',
+          enabled: true,
+          frequency: merged.settings.schedule.frequency,
+          day: merged.settings.schedule.day,
+          hour: merged.settings.schedule.hour,
+          minute: 0,
+          tasks: allCleanerTasks,
+          autoApply: false,
+          lastRunAt: null,
+          lastRunStatus: 'never',
+          createdAt: new Date().toISOString()
+        }
+        merged.settings.schedules = [migrated]
+        merged.settings.schedule.enabled = false
+        // Persist migration immediately (best-effort — retried on the next read)
+        try {
+          writeStore(merged)
+        } catch (err) {
+          logError('Schedule migration write failed', err)
+        }
+      }
+      delete (merged.settings as unknown as Record<string, unknown>).cloud
+      return merged
+    }
+  } catch (err) {
+    // Corrupt or unreadable file. Falling back to defaults resets every
+    // setting and re-triggers onboarding, so leave a trace of why.
+    logError('config.json could not be read — falling back to defaults', err)
+  }
+  // No persisted config (fresh install, or one we just failed to read): start
+  // in the OS language rather than always in English.
+  const fresh = JSON.parse(JSON.stringify(defaults)) as StoreData
+  fresh.settings.language = resolveSystemLanguage()
+  return fresh
+}
+
+/**
+ * Attempts for a single write. On Windows an antivirus scanner or the search
+ * indexer routinely holds a just-written file open for a few milliseconds,
+ * which surfaces as a transient EPERM/EBUSY — retrying clears it.
+ */
+const WRITE_ATTEMPTS = 3
+const WRITE_RETRY_MS = 40
+
+function sleepSync(ms: number): void {
+  // Deliberately blocking: writeStore runs inside the write lock and callers
+  // (including quit paths) rely on it being synchronous. Atomics.wait parks the
+  // thread rather than spinning, and only ever runs on a failed write.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+}
+
+/**
+ * Write the whole store to disk.
+ *
+ * Writes to a sibling temp file and renames over the target so a crash or
+ * power loss mid-write can never leave a truncated config.json — a parse
+ * failure there sends readStore() back to the defaults, silently resetting
+ * every setting (and re-triggering onboarding, issue #269).
+ *
+ * Throws if the write ultimately fails. Callers must not swallow that: a
+ * silent failure here is indistinguishable from a successful save.
+ */
+function writeStore(data: StoreData): void {
+  ensureDir()
+  const toWrite = JSON.parse(JSON.stringify(data)) as StoreData
+  // Remove legacy remote-service settings from existing configurations.
+  delete (toWrite.settings as unknown as Record<string, unknown>).cloud
+  const json = JSON.stringify(toWrite, null, 2)
+  const target = getConfigPath()
+  const tmp = `${target}.${process.pid}.tmp`
+
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= WRITE_ATTEMPTS; attempt++) {
+    try {
+      writeFileSync(tmp, json, 'utf-8')
+      renameSync(tmp, target)
+      return
+    } catch (err) {
+      lastErr = err
+      try {
+        unlinkSync(tmp)
+      } catch {
+        /* nothing to clean up */
+      }
+      if (attempt < WRITE_ATTEMPTS) sleepSync(WRITE_RETRY_MS)
+    }
+  }
+  throw lastErr
+}
+
+export function getSettings(): AtlasSettings {
+  return readStore().settings
+}
+
+// Simple mutex to prevent TOCTOU race on concurrent read-modify-write
+let writeLock: Promise<void> = Promise.resolve()
+
+/**
+ * Serialize one read-modify-write of config.json behind the write lock.
+ *
+ * `mutate` runs on a copy freshly read inside the lock, so concurrent writers
+ * never compute from a stale base. Returning `false` from it skips the write.
+ *
+ * The queue promise (`writeLock`) always resolves, so one failed write can
+ * never wedge every write after it. The promise handed back to the *caller*
+ * rejects when the write failed: the store must never report a save it did
+ * not make, which is how the onboarding flag went missing with nothing in the
+ * log to show for it (issue #269).
+ */
+function runLocked(what: string, mutate: (data: StoreData) => boolean | void): Promise<void> {
+  const prev = writeLock
+  let unlock: () => void
+  writeLock = new Promise<void>((r) => {
+    unlock = r
+  })
+  return prev.then(() => {
+    try {
+      const data = readStore()
+      if (mutate(data) === false) return
+      writeStore(data)
+    } catch (err) {
+      logError(`Failed to persist ${what} to config.json`, err)
+      throw err
+    } finally {
+      unlock!()
+    }
+  })
+}
+
+export function setSettings(partial: Partial<AtlasSettings>): Promise<void> {
+  const write = runLocked('settings', (data) => {
+    const patch = { ...partial }
+    if (patch.schedules)
+      patch.schedules = patch.schedules.map((entry) => {
+        const previous = data.settings.schedules.find((e) => e.id === entry.id)
+        // Editing or re-enabling a schedule must not turn its most recent past occurrence
+        // into a "missed" run that starts unattended; catch-up covers later ones only.
+        const redefined = previous && scheduleDefinition(previous) !== scheduleDefinition(entry)
+        return {
+          ...entry,
+          lastDueAt: redefined ? new Date().toISOString() : (previous?.lastDueAt ?? null),
+          lastRunAt: previous?.lastRunAt ?? null,
+          lastRunStatus: previous?.lastRunStatus ?? 'never'
+        }
+      })
+    data.settings = deepMerge(data.settings, patch)
+  })
+  // Existing fire-and-forget callers remain safe; awaiting callers receive the failure.
+  void write.catch(() => {
+    /* logged in runLocked */
+  })
+  return write
+}
+
+/**
+ * Atomically update a single schedule entry within the write lock.
+ * Unlike setSettings({ schedules: [...] }), this reads the latest schedules
+ * inside the lock so concurrent completions don't clobber each other.
+ */
+export function updateScheduleEntry(
+  scheduleId: string,
+  patch: Partial<import('../../shared/types').ScheduleEntry>
+): void {
+  void runLocked('schedule entry', (data) => {
+    data.settings.schedules = data.settings.schedules.map((s) =>
+      s.id === scheduleId ? { ...s, ...patch } : s
+    )
+  }).catch(() => {
+    /* logged in runLocked */
+  })
+}
+
+/**
+ * Atomically add or remove registry-tweak ignore signatures within the write
+ * lock. Reads the latest list inside the lock so a toggle can never compute
+ * from a stale in-memory base and drop previously-ignored signatures (issue
+ * #172). `ignored = true` adds the signatures, `false` removes them.
+ */
+export function updateRegistryIgnoredTweaks(signatures: string[], ignored: boolean): void {
+  void runLocked('registry ignore list', (data) => {
+    const set = new Set(data.settings.registryIgnoredTweaks ?? [])
+    for (const sig of signatures) {
+      if (!sig) continue
+      if (ignored) set.add(sig)
+      else set.delete(sig)
+    }
+    // Bound the list to match validation (oldest entries dropped first).
+    data.settings.registryIgnoredTweaks = [...set].slice(-200)
+  }).catch(() => {
+    /* logged in runLocked */
+  })
+}
+
+/**
+ * Atomically add or remove a driver-update ignore entry (Windows Update
+ * UpdateID) within the write lock, so concurrent toggles never clobber each
+ * other. Resolves once the change is persisted.
+ */
+export function updateIgnoredDriverUpdates(updateId: string, ignored: boolean): Promise<void> {
+  if (!updateId) return Promise.resolve()
+  return runLocked('driver ignore list', (data) => {
+    const set = new Set(data.settings.ignoredDriverUpdates ?? [])
+    if (ignored) set.add(updateId)
+    else set.delete(updateId)
+    // Bound the list to match validation (oldest entries dropped first).
+    data.settings.ignoredDriverUpdates = [...set].slice(-500)
+  })
+}
+
+/** Read the malware false-positive allowlist. */
+export function getMalwareAllowlist(): MalwareAllowlistEntry[] {
+  return readStore().settings.malwareAllowlist ?? []
+}
+
+/**
+ * Add a file to the malware false-positive allowlist within the write lock.
+ * De-dupes by content hash (a re-ignore refreshes the existing entry's
+ * path/detection metadata) and caps the list to the most recent 500 entries.
+ */
+export function addMalwareAllowlistEntry(entry: MalwareAllowlistEntry): Promise<void> {
+  return runLocked('malware allowlist', (data) => {
+    const list = (data.settings.malwareAllowlist ?? []).filter((e) => e.sha256 !== entry.sha256)
+    list.push(entry)
+    data.settings.malwareAllowlist = list.slice(-500)
+  })
+}
+
+/** Remove an allowlist entry by content hash within the write lock. */
+export function removeMalwareAllowlistEntry(sha256: string): Promise<void> {
+  return runLocked('malware allowlist', (data) => {
+    data.settings.malwareAllowlist = (data.settings.malwareAllowlist ?? []).filter(
+      (e) => e.sha256 !== sha256
+    )
+  })
+}
+
+/** Read the last persisted main-window geometry (null on first run). */
+export function getWindowState(): WindowState | null {
+  return readStore().windowState ?? null
+}
+
+/**
+ * Persist the main-window geometry within the write lock so a resize landing
+ * at the same time as a settings write can't clobber either one.
+ */
+export function setWindowState(state: WindowState): Promise<void> {
+  return runLocked('window geometry', (data) => {
+    data.windowState = state
+  })
+}
+
+/** Wait for any pending setSettings() writes to complete */
+export function flushSettings(): Promise<void> {
+  return writeLock
+}
+
+export function getOnboardingComplete(): boolean {
+  return readStore().onboardingComplete
+}
+
+export function setOnboardingComplete(value: boolean): Promise<void> {
+  return runLocked('onboarding completion', (data) => {
+    data.onboardingComplete = value
+  })
+}
+
+/** Permanent machine identifier — generated once, persists across unlink/relink/updates */
+export function getMachineId(): string {
+  const data = readStore()
+  if (data.machineId) return data.machineId
+  // First call ever — generate and persist (uses lock to avoid concurrent writes)
+  const id = randomUUID()
+  void runLocked('machine id', (fresh) => {
+    // A concurrent caller may have won the race and already stored one.
+    if (fresh.machineId) return false
+    fresh.machineId = id
+  }).catch(() => {
+    /* logged in runLocked */
+  })
+  return id
+}
+
+/** Persist before dispatch, and reject a definition edited while conditions were evaluated. */
+export async function claimScheduleOccurrence(
+  entry: import('../../shared/types').ScheduleEntry,
+  dueAt: string
+): Promise<boolean> {
+  let claimed = false
+  await runLocked('schedule occurrence', (data) => {
+    const current = data.settings.schedules.find((e) => e.id === entry.id)
+    if (
+      !current ||
+      !current.enabled ||
+      scheduleDefinition(current) !== scheduleDefinition(entry) ||
+      Date.parse(current.lastDueAt ?? '') >= Date.parse(dueAt)
+    )
+      return false
+    current.lastDueAt = dueAt
+    claimed = true
+  })
+  return claimed
+}

@@ -1,0 +1,43 @@
+{
+  "pageTitle": "Ferramentas e instalação",
+  "pageDescription": "Explore ferramentas adicionais e opções para instalar programas.",
+  "catalogTitle": "Ferramentas de manutenção",
+  "catalogDescription": "Abra a página oficial do projeto ou baixe uma versão publicada. Os arquivos não são instalados nem executados automaticamente.",
+  "searchPlaceholder": "Buscar ferramentas",
+  "noResults": "Nenhuma ferramenta corresponde à busca.",
+  "downloadDirect": "Baixar direto",
+  "downloading": "Baixando…",
+  "openGithub": "Abrir GitHub",
+  "openOfficialSite": "Site oficial",
+  "downloadUnavailable": "O download direto não está disponível aqui; use o site oficial.",
+  "windowsOnlyDownload": "O download pelo PowerShell está disponível somente no Windows.",
+  "downloadSuccess": "Baixado em {{path}}",
+  "downloadError": "Não foi possível concluir o download.",
+  "siteError": "Não foi possível abrir a página oficial.",
+  "safetyNote": "Quando disponível, o download usa a fonte oficial da versão. O Atlas confere o projeto e o tamanho do arquivo, salva em Downloads/Atlas-Tools e nunca executa o arquivo.",
+  "categories": {
+    "apps": "Programas e ajustes do Windows",
+    "cleanup": "Limpeza",
+    "storage": "Armazenamento e arquivos",
+    "diagnostics": "Diagnóstico",
+    "backup": "Backup",
+    "recovery": "Recuperação",
+    "network": "Rede"
+  },
+  "checklist": {
+    "title": "Depois de reinstalar o Windows",
+    "description": "Marque cada etapa concluída; o checklist fica salvo neste computador.",
+    "saveError": "Não foi possível salvar o checklist.",
+    "items": [
+      "Ativar o Windows e confirmar se a edição instalada corresponde à licença.",
+      "Instalar as atualizações do Windows e reiniciar quando solicitado.",
+      "Instalar drivers pelo Windows Update ou pelo site do fabricante do computador.",
+      "Instalar os programas essenciais que você usa no dia a dia.",
+      "Atualizar a Segurança do Windows e fazer uma verificação.",
+      "Criar um ponto de restauração antes de alterar configurações do sistema.",
+      "Fazer backup dos documentos em outro disco ou na nuvem.",
+      "Preparar uma mídia de recuperação em um pendrive vazio.",
+      "Conferir internet, áudio, Bluetooth, impressora e Gerenciador de Dispositivos."
+    ]
+  }
+}

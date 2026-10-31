@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Keluar",
+  "scheduledTaskNotificationTitle": "Atlas - Tugas Terjadwal",
+  "scheduledTaskNotificationBody": "Menjalankan \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Pemindaian Selesai",
+  "scanCompleteNotificationBody": "Ditemukan {{itemCount}} item ({{sizeMB}} MB) yang dapat dibersihkan.",
+  "scheduledScanName": "Pemindaian Terjadwal",
+  "openAtlas": "Buka Atlas"
+}

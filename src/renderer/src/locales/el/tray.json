@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Έξοδος",
+  "scheduledTaskNotificationTitle": "Atlas - Προγραμματισμένη εργασία",
+  "scheduledTaskNotificationBody": "Εκτέλεση του \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Η σάρωση ολοκληρώθηκε",
+  "scanCompleteNotificationBody": "Βρέθηκαν {{itemCount}} στοιχεία ({{sizeMB}} MB) που μπορούν να καθαριστούν.",
+  "scheduledScanName": "Προγραμματισμένη σάρωση",
+  "openAtlas": "Άνοιγμα του Atlas"
+}

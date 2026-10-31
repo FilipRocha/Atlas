@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "إنهاء",
+  "scheduledTaskNotificationTitle": "Atlas - مهمة مجدولة",
+  "scheduledTaskNotificationBody": "جارٍ تشغيل \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - اكتمل الفحص",
+  "scanCompleteNotificationBody": "تم العثور على {{itemCount}} عنصرًا ({{sizeMB}} ميجابايت) يمكن تنظيفها.",
+  "scheduledScanName": "فحص مجدول",
+  "openAtlas": "فتح Atlas"
+}

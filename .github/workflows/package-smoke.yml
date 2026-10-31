@@ -1,0 +1,83 @@
+name: CI - Package Smoke Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - '.nvmrc'
+      - 'electron-builder.yml'
+      - 'electron.vite.config.ts'
+      - 'tsconfig*.json'
+      - 'src/**'
+      - 'rules/**'
+      - 'resources/**'
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/**'
+  schedule:
+    - cron: '30 5 * * 2'
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Source ref to validate for release recovery
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-smoke-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    name: Packaged App (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            # The smoke executable must start unattended without a UAC prompt.
+            # This override applies only to this unpublished test package.
+            args: --win --x64 -c.win.requestedExecutionLevel=asInvoker
+            executable: dist/win-unpacked/Atlas.exe
+          - os: ubuntu-24.04-arm
+            args: --linux --arm64
+            executable: dist/linux-arm64-unpacked/atlas
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.sha }}
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build
+        run: npm run build
+      - name: Fetch verified WinGet bundle
+        if: runner.os == 'Windows'
+        run: npm run fetch:winget-bundle
+      - name: Build Windows hardware bridge and process monitor
+        if: runner.os == 'Windows'
+        run: |
+          npm run build:hardware-bridge
+          npm run build:process-monitor
+      - name: Package without signing or publishing
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --dir --publish never ${{ matrix.args }}
+      - name: Verify packaged resources, native modules, and CLI
+        run: node scripts/package-smoke-test.js "${{ matrix.executable }}"
+        timeout-minutes: 5

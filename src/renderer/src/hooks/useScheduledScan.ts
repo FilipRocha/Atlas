@@ -1,0 +1,400 @@
+import { useEffect, useRef } from 'react'
+import { toast } from 'sonner'
+import { useScanStore } from '@/stores/scan-store'
+import { useHistoryStore } from '@/stores/history-store'
+import { useSettingsStore, refreshSettings } from '@/stores/settings-store'
+import { ScanStatus } from '@shared/enums'
+import type { ScanResult, ScheduleEntry } from '@shared/types'
+import { formatBytes, formatNumber } from '@/lib/utils'
+
+class ScheduleConditionChanged extends Error {}
+interface ScheduleRunPayload {
+  runId: string
+  cleanerSubcategories?: ScheduleEntry['cleanerSubcategories']
+  scheduleId: string
+  scheduleName: string
+  tasks: string[]
+  autoApply: boolean
+}
+
+// Map task types to scan/clean functions
+const CLEANER_TASKS: Record<
+  string,
+  {
+    label: string
+    scan: () => Promise<ScanResult[]>
+    clean: (ids: string[]) => Promise<any>
+  }
+> = {
+  'cleaner:system': {
+    label: 'System',
+    scan: () => window.atlas.systemScan(),
+    clean: (ids) => window.atlas.systemClean(ids)
+  },
+  'cleaner:browsers': {
+    label: 'Browsers',
+    scan: () => window.atlas.browserScan(),
+    clean: (ids) => window.atlas.browserClean(ids)
+  },
+  'cleaner:apps': {
+    label: 'Applications',
+    scan: () => window.atlas.appScan(),
+    clean: (ids) => window.atlas.appClean(ids)
+  },
+  'cleaner:gaming': {
+    label: 'Gaming',
+    scan: () => window.atlas.gamingScan(),
+    clean: (ids) => window.atlas.gamingClean(ids)
+  },
+  'cleaner:recycleBin': {
+    label: 'Recycle Bin',
+    scan: () => window.atlas.recycleBinScan(),
+    clean: () => window.atlas.recycleBinClean()
+  },
+  'cleaner:databases': {
+    label: 'Databases',
+    scan: () => window.atlas.databaseScan(),
+    clean: (ids) => window.atlas.databaseClean(ids)
+  }
+}
+
+/**
+ * Execute a single schedule's tasks.
+ */
+export async function runSchedule(payload: ScheduleRunPayload): Promise<void> {
+  const store = useScanStore.getState()
+  const startTime = Date.now()
+
+  let started = false
+  const startedTasks = new Set<string>()
+  const markStarted = (taskType: string) => {
+    started = true
+    startedTasks.add(taskType)
+  }
+  const assertAllowed = async () => {
+    const result = await window.atlas.scheduleAuthorize(payload.scheduleId, payload.runId)
+    if (!result.allowed) throw new ScheduleConditionChanged(result.reason ?? 'unavailable')
+  }
+  let status: 'success' | 'partial' | 'failed' | 'skipped' = 'success'
+  let totalSize = 0
+  let totalItems = 0
+  let totalCleaned = 0
+  let totalSpaceSaved = 0
+  const categoryResults: Record<string, { found: number; cleaned: number; size: number }> = {}
+
+  const recordHistory = async () => {
+    // Pick the most representative history type based on tasks that actually started; a
+    // workflow stopped early must not be filed under a later task that never ran.
+    const ran = [...startedTasks]
+    const historyType = ran.some((t) => t.startsWith('cleaner:'))
+      ? 'cleaner'
+      : ran.includes('registry')
+        ? 'registry'
+        : ran.includes('drivers')
+          ? 'drivers'
+          : ran.includes('software-update')
+            ? 'software-update'
+            : 'cleaner'
+
+    // Log to history
+    await useHistoryStore.getState().addEntry({
+      id: Date.now().toString(),
+      type: historyType,
+      timestamp: new Date().toISOString(),
+      duration: Date.now() - startTime,
+      // Window for looking up the deleted paths in the deletion log
+      cleanedFrom: new Date(startTime).toISOString(),
+      cleanedTo: new Date().toISOString(),
+      totalItemsFound: totalItems,
+      totalItemsCleaned: totalCleaned,
+      totalItemsSkipped: totalItems - totalCleaned,
+      totalSpaceSaved,
+      categories: Object.entries(categoryResults).map(([name, d]) => ({
+        name,
+        itemsFound: d.found,
+        itemsCleaned: d.cleaned,
+        spaceSaved: d.size
+      })),
+      errorCount: status === 'success' ? 0 : 1,
+      scheduled: true,
+      scheduleName: payload.scheduleName
+    })
+  }
+  try {
+    await assertAllowed()
+    toast.info(`Running "${payload.scheduleName}"`, { description: 'Scheduled task started...' })
+    store.setStatus(ScanStatus.Scanning)
+    store.setResults([])
+    // ── Restore point before the first auto-apply clean ──
+    // Created lazily so a run that ends up cleaning nothing (e.g. a scope of
+    // only opt-in cache resets) never pays for a restore point.
+    let restorePointAttempted = false
+    const ensureRestorePoint = async (): Promise<void> => {
+      if (restorePointAttempted) return
+      restorePointAttempted = true
+      if (!useSettingsStore.getState().settings.cleaner.createRestorePoint) return
+      try {
+        await window.atlas.createRestorePoint(`Atlas scheduled clean — ${payload.scheduleName}`)
+      } catch (error) {
+        if (error instanceof ScheduleConditionChanged) throw error
+        // Best-effort — don't block the clean
+      }
+    }
+
+    // ── Cleaner tasks ──
+    const { protectRecycleBin } = useSettingsStore.getState().settings.cleaner
+    // Each selected task runs in the user's chosen order.
+    for (const taskType of payload.tasks) {
+      await assertAllowed()
+      if (taskType.startsWith('cleaner:')) {
+        if (taskType === 'cleaner:recycleBin' && protectRecycleBin) continue
+        const task = CLEANER_TASKS[taskType]
+        if (!task) continue
+        try {
+          const scanned = await task.scan()
+          markStarted(taskType)
+          const scope =
+            payload.cleanerSubcategories?.[
+              taskType as keyof NonNullable<ScheduleEntry['cleanerSubcategories']>
+            ]
+          const results = scope ? scanned.filter((r) => scope.includes(r.subcategory)) : scanned
+          store.addResults(results)
+          const found = results.reduce((s, r) => s + r.itemCount, 0)
+          const size = results.reduce((s, r) => s + r.totalSize, 0)
+          totalSize += size
+          totalItems += found
+
+          // Cache resets and native maintenance are opt-in: they stay unselected
+          // in the cleaner and need explicit flags in the CLI, so an unattended
+          // run must never pick them up just because they were scanned.
+          const allIds = results.flatMap((r) =>
+            r.items.filter((i) => !i.cacheReset && !i.cleanupAction).map((i) => i.id)
+          )
+          if (payload.autoApply && allIds.length > 0) {
+            try {
+              await assertAllowed()
+              await ensureRestorePoint()
+              // Creating a restore point can take a minute; the schedule's
+              // conditions must still hold right before anything is deleted.
+              await assertAllowed()
+              const cleanResult = await task.clean(allIds)
+              if (cleanResult?.errors?.length) status = 'partial'
+              const cleaned = cleanResult?.filesDeleted ?? 0
+              const saved = cleanResult?.totalCleaned ?? 0
+              totalCleaned += cleaned
+              totalSpaceSaved += saved
+              categoryResults[task.label] = { found, cleaned, size: saved }
+            } catch (error) {
+              if (error instanceof ScheduleConditionChanged) throw error
+              status = 'partial'
+              categoryResults[task.label] = { found, cleaned: 0, size: 0 }
+            }
+          } else if (found > 0) {
+            categoryResults[task.label] = { found, cleaned: 0, size }
+          }
+        } catch (error) {
+          if (error instanceof ScheduleConditionChanged) throw error
+          status = 'partial'
+        }
+      }
+
+      // ── Registry fixes ──
+      if (taskType === 'registry') {
+        try {
+          markStarted(taskType)
+          const entries = await window.atlas.registryScan()
+          const found = entries.length
+          totalItems += found
+          if (payload.autoApply && found > 0) {
+            const ids = entries.map((e) => e.id)
+            try {
+              await assertAllowed()
+              const result = await window.atlas.registryFix(ids)
+              if (result.failed > 0) status = 'partial'
+              totalCleaned += result.fixed
+              categoryResults['Registry'] = { found, cleaned: result.fixed, size: 0 }
+            } catch (error) {
+              if (error instanceof ScheduleConditionChanged) throw error
+              status = 'partial'
+              categoryResults['Registry'] = { found, cleaned: 0, size: 0 }
+            }
+          } else if (found > 0) {
+            categoryResults['Registry'] = { found, cleaned: 0, size: 0 }
+          }
+        } catch (error) {
+          if (error instanceof ScheduleConditionChanged) throw error
+          status = 'partial'
+        }
+      }
+
+      // ── Driver updates ──
+      if (taskType === 'drivers') {
+        try {
+          markStarted(taskType)
+          const result = await window.atlas.driverUpdateScan()
+          const found = result.updates.length
+          totalItems += found
+          if (payload.autoApply && found > 0) {
+            const ids = result.updates.map((u) => u.updateId)
+            try {
+              await assertAllowed()
+              const installResult = await window.atlas.driverUpdateInstall(ids)
+              if (installResult.failed > 0) status = 'partial'
+              totalCleaned += installResult.installed
+              categoryResults['Drivers'] = { found, cleaned: installResult.installed, size: 0 }
+            } catch (error) {
+              if (error instanceof ScheduleConditionChanged) throw error
+              status = 'partial'
+              categoryResults['Drivers'] = { found, cleaned: 0, size: 0 }
+            }
+          } else if (found > 0) {
+            categoryResults['Drivers'] = { found, cleaned: 0, size: 0 }
+          }
+        } catch (error) {
+          if (error instanceof ScheduleConditionChanged) throw error
+          status = 'partial'
+        }
+      }
+
+      // ── Software updates ──
+      if (taskType === 'software-update') {
+        try {
+          markStarted(taskType)
+          const result = await window.atlas.softwareUpdateCheck()
+          const found = result.apps.length
+          totalItems += found
+          if (payload.autoApply && found > 0) {
+            const items = result.apps.map((a) => ({ id: a.id, source: a.source }))
+            try {
+              await assertAllowed()
+              const updateResult = await window.atlas.softwareUpdateRun(items)
+              if (updateResult.failed > 0) status = 'partial'
+              totalCleaned += updateResult.succeeded
+              categoryResults['Software'] = { found, cleaned: updateResult.succeeded, size: 0 }
+            } catch (error) {
+              if (error instanceof ScheduleConditionChanged) throw error
+              status = 'partial'
+              categoryResults['Software'] = { found, cleaned: 0, size: 0 }
+            }
+          } else if (found > 0) {
+            categoryResults['Software'] = { found, cleaned: 0, size: 0 }
+          }
+        } catch (error) {
+          if (error instanceof ScheduleConditionChanged) throw error
+          status = 'partial'
+        }
+      }
+    }
+    store.setStatus(ScanStatus.Complete)
+    store.setProgress(null)
+
+    await recordHistory()
+
+    // Notify main process and refresh renderer state so the UI shows updated status
+    window.atlas.notifyScheduledScanComplete?.(totalSize, totalItems)
+    await window.atlas.scheduleRunComplete?.(payload.scheduleId, status, payload.runId)
+    refreshSettings()
+
+    const desc = payload.autoApply
+      ? `Cleaned ${formatNumber(totalCleaned)} items (${formatBytes(totalSpaceSaved)}).`
+      : `Found ${formatNumber(totalItems)} items (${formatBytes(totalSize)}) that can be cleaned.`
+    if (status === 'success')
+      toast.success(`"${payload.scheduleName}" complete`, { description: desc })
+    else toast.warning(`"${payload.scheduleName}" completed with issues`, { description: desc })
+  } catch (error) {
+    if (error instanceof ScheduleConditionChanged) {
+      store.setStatus(ScanStatus.Complete)
+      store.setProgress(null)
+      status = started ? 'partial' : 'skipped'
+      if (started) await recordHistory()
+      await window.atlas.scheduleRunComplete?.(
+        payload.scheduleId,
+        started ? 'partial' : 'deferred',
+        payload.runId
+      )
+      refreshSettings()
+      toast.warning(`"${payload.scheduleName}" stopped`, {
+        description:
+          'Conditions changed (' + error.message + '). Completed actions were not repeated.'
+      })
+      return
+    }
+    store.setStatus(ScanStatus.Error)
+    store.setProgress(null)
+    status = 'failed'
+    try {
+      await window.atlas.scheduleRunComplete?.(payload.scheduleId, status, payload.runId)
+    } catch {
+      /* main releases the run itself once the window reports back or goes away */
+    }
+    refreshSettings()
+    toast.error(`"${payload.scheduleName}" failed`, {
+      description: 'An error occurred during the scheduled task.'
+    })
+  }
+}
+
+/**
+ * Hook that listens for scheduled scan triggers from the main process
+ * and runs the configured tasks when triggered. Queues multiple triggers.
+ */
+export function useScheduledScan(): void {
+  const runningRef = useRef(false)
+  const queueRef = useRef<ScheduleRunPayload[]>([])
+
+  useEffect(() => {
+    if (!window.atlas?.onScheduleRunTrigger) return undefined
+
+    const waitForIdle = async (): Promise<boolean> => {
+      // Wait up to 5 minutes for any manual scan/clean to finish
+      for (let waited = 0; waited < 300_000; waited += 10_000) {
+        const s = useScanStore.getState().status
+        if (s !== ScanStatus.Scanning && s !== ScanStatus.Cleaning) return true
+        await new Promise((r) => setTimeout(r, 10_000))
+      }
+      return false
+    }
+
+    const processQueue = async () => {
+      try {
+        while (queueRef.current.length > 0) {
+          const next = queueRef.current.shift()!
+          try {
+            // Wait for any manual work to finish before running
+            const idle = await waitForIdle()
+            if (!idle) {
+              await window.atlas.scheduleRunComplete?.(next.scheduleId, 'deferred', next.runId)
+              toast.warning(`"${next.scheduleName}" skipped`, {
+                description: 'Timed out waiting for manual scan to finish.'
+              })
+              continue
+            }
+            await runSchedule(next)
+          } catch (error) {
+            if (error instanceof ScheduleConditionChanged) throw error
+            // Ensure completion is reported even on unexpected errors
+            await window.atlas.scheduleRunComplete?.(next.scheduleId, 'failed', next.runId)
+          }
+        }
+      } finally {
+        runningRef.current = false
+      }
+    }
+
+    const unsubscribe = window.atlas.onScheduleRunTrigger((payload: ScheduleRunPayload) => {
+      // Main rolls back triggers nobody acknowledges (renderer not mounted yet, reload).
+      void window.atlas.scheduleRunAck?.(payload.scheduleId, payload.runId).catch(() => {})
+      queueRef.current.push(payload)
+      if (!runningRef.current) {
+        runningRef.current = true
+        processQueue().catch(() => {
+          /* the run already reported its own outcome */
+        })
+      }
+    })
+
+    return () => {
+      unsubscribe()
+    }
+  }, [])
+}

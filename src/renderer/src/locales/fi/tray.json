@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Lopeta",
+  "scheduledTaskNotificationTitle": "Atlas - Ajastettu tehtävä",
+  "scheduledTaskNotificationBody": "Suoritetaan \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Tarkistus valmis",
+  "scanCompleteNotificationBody": "Löytyi {{itemCount}} kohdetta ({{sizeMB}} MB), jotka voidaan puhdistaa.",
+  "scheduledScanName": "Ajastettu tarkistus",
+  "openAtlas": "Avaa Atlas"
+}

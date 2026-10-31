@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Sair",
+  "scheduledTaskNotificationTitle": "Atlas - Tarefa Agendada",
+  "scheduledTaskNotificationBody": "A executar \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Verificação Concluída",
+  "scanCompleteNotificationBody": "Foram encontrados {{itemCount}} itens ({{sizeMB}} MB) que podem ser limpos.",
+  "scheduledScanName": "Verificação Agendada",
+  "openAtlas": "Abrir Atlas"
+}

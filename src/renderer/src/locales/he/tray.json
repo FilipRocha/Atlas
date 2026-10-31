@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "יציאה",
+  "scheduledTaskNotificationTitle": "Atlas - משימה מתוזמנת",
+  "scheduledTaskNotificationBody": "מפעיל את \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - הסריקה הושלמה",
+  "scanCompleteNotificationBody": "נמצאו {{itemCount}} פריטים ({{sizeMB}} MB) שניתן לנקות.",
+  "scheduledScanName": "סריקה מתוזמנת",
+  "openAtlas": "פתח את Atlas"
+}

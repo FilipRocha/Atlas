@@ -1,0 +1,850 @@
+import { startStorageHistory, stopStorageHistory } from './services/storage-history'
+import { app, BrowserWindow, ipcMain, Menu, nativeImage, screen, shell, Tray } from 'electron'
+import { execFile } from 'child_process'
+import { readFileSync, writeFileSync } from 'fs'
+import { randomUUID } from 'crypto'
+import { promisify } from 'util'
+import { isAbsolute, join } from 'path'
+
+const execFileAsync = promisify(execFile)
+import { execNativeUtf8, killAllChildren } from './services/exec-utf8'
+import { IPC } from '../shared/channels'
+import { EXTERNAL_TOOLS } from '../shared/external-tools'
+import { t } from './i18n'
+import { registerCleanerIpc } from './ipc'
+import {
+  loadWindowState,
+  trackWindowState,
+  MIN_WINDOW_WIDTH,
+  MIN_WINDOW_HEIGHT
+} from './services/window-state'
+import {
+  startScheduler,
+  stopScheduler,
+  getNextScanTime,
+  notifyScheduledScanComplete,
+  completeScheduleRun,
+  authorizeScheduleStep,
+  acknowledgeScheduleRun,
+  getScheduleRuntime,
+  runScheduleNow
+} from './services/scheduler'
+import { initAutoUpdater } from './services/auto-updater'
+import { attachRendererDiagnostics } from './services/renderer-diagnostics'
+import {
+  shouldDisableGpu,
+  applyGpuFallbackSwitches,
+  registerGpuCrashRecovery
+} from './services/gpu-fallback'
+import { runCli } from './cli'
+import { createWindowsTrayIcon } from './tray-icon'
+import { isAdmin } from './services/elevation'
+import { skipPortableStartup } from './services/portable'
+import { getSettings } from './services/settings-store'
+
+// ─── Disable hardware acceleration ──────────────────────────
+// Must be called before app.whenReady().  On machines with incompatible
+// GPU drivers, broken ANGLE, or certain VM setups, Chromium's GPU
+// compositor silently fails — resulting in a black window that the user
+// can resize but never see content in.  For a system-cleaner utility the
+// visual trade-off (software compositing) is negligible.
+app.disableHardwareAcceleration()
+
+// ─── Headless mode flags ─────────────────────────────────────
+// When running without a GUI (CLI), disable sandbox
+// so Electron works on headless Linux servers without X11/Wayland.
+// IMPORTANT: Clear DISPLAY before Chromium initializes — otherwise the
+// native layer picks the X11 ozone backend before app.commandLine
+// switches are processed, and crashes if no X server is running.
+if (process.argv.includes('--cli')) {
+  delete process.env.DISPLAY
+  delete process.env.WAYLAND_DISPLAY
+  app.commandLine.appendSwitch('no-sandbox')
+  app.commandLine.appendSwitch('ozone-platform', 'headless')
+}
+
+// ─── Data directory override ────────────────────────────────
+// When relaunched as root (macOS/Linux), the elevated process receives
+// --atlas-data-dir=<path> so it reads/writes the original user's config
+// instead of /var/root/... or /root/...
+const dataDirFlag = process.argv.find((a) => a.startsWith('--atlas-data-dir='))
+if (dataDirFlag) {
+  const dir = dataDirFlag.slice('--atlas-data-dir='.length)
+  if (dir && require('path').isAbsolute(dir)) {
+    app.setPath('userData', dir)
+  }
+}
+
+// QA app smoke runs use a fresh profile so startup checks cannot modify the
+// user's real settings, logs, or application data.
+const isQaSmoke = process.env['ATLAS_QA_MODE'] === '1'
+const qaUserDataDir = process.env['ATLAS_QA_USER_DATA_DIR']
+if (isQaSmoke && qaUserDataDir && isAbsolute(qaUserDataDir)) {
+  app.setPath('userData', qaUserDataDir)
+}
+
+// ─── GPU process fallback ───────────────────────────────────
+// disableHardwareAcceleration() still spawns a GPU process; on stripped
+// Windows builds that process fails to launch and Chromium fatally aborts
+// (issue #203).  If a prior launch hit that, or the user opted in, fully
+// disable the GPU process.  Otherwise watch for the failure and recover by
+// relaunching with --disable-gpu.  Placed after the data-dir override so
+// the marker is read from the correct userData path.
+if (shouldDisableGpu()) {
+  applyGpuFallbackSwitches()
+} else {
+  registerGpuCrashRecovery()
+}
+
+// ─── Root detection (macOS + Linux) ─────────────────────────
+// Chromium refuses to run as root without --no-sandbox.  Also required
+// on macOS for clipboard access (paste) in the elevated process.
+const isRoot =
+  (process.platform === 'linux' || process.platform === 'darwin') &&
+  typeof process.getuid === 'function' &&
+  process.getuid() === 0
+
+if (isRoot) {
+  app.commandLine.appendSwitch('no-sandbox')
+  // On some Linux desktops (e.g. Linux Mint / Cinnamon) the software
+  // compositor still fails to paint when running as root — the window
+  // loads (cursor reacts) but remains grey.  Disabling GPU compositing
+  // forces a fallback path that reliably renders.
+  if (process.platform === 'linux') {
+    app.commandLine.appendSwitch('disable-gpu-compositing')
+    app.commandLine.appendSwitch('in-process-gpu')
+  }
+}
+
+// ─── CLI mode ───────────────────────────────────────────────
+// If --cli is passed, run headless and exit — no GUI, no tray.
+if (process.argv.includes('--cli')) {
+  app.whenReady().then(() => runCli())
+} else {
+  initGui()
+}
+
+function initGui(): void {
+  // Prevent multiple instances — if another is already running, focus it and quit this one
+  // Development previews can run alongside an installed Atlas copy. Packaged
+  // builds keep the normal single-instance guarantee.
+  const gotLock = app.isPackaged ? app.requestSingleInstanceLock() : true
+  if (!gotLock) {
+    app.quit()
+    return
+  }
+
+  let mainWindow: BrowserWindow | null = null
+  let tray: Tray | null = null
+  let ipcRegistered = false
+  // Set once the app is actually quitting (Cmd+Q, tray Quit, OS shutdown) so the
+  // minimize-to-tray close interceptor lets windows close instead of aborting quit
+  let isQuitting = false
+
+  function getIconPath(): string {
+    const ext =
+      process.platform === 'darwin' ? 'icns' : process.platform === 'linux' ? 'png' : 'ico'
+    return app.isPackaged
+      ? join(process.resourcesPath, `icon.${ext}`)
+      : join(__dirname, `../../resources/icon.${ext}`)
+  }
+
+  function getIconsDir(): string {
+    return app.isPackaged
+      ? join(process.resourcesPath, 'icons')
+      : join(__dirname, '../../resources/icons')
+  }
+
+  function createTrayIcon(): Electron.NativeImage {
+    if (process.platform === 'win32') {
+      return createWindowsTrayIcon(nativeImage, join(getIconsDir(), 'tray'))
+    }
+
+    if (process.platform === 'darwin') {
+      // Build a multi-resolution image so the icon is sharp on Retina displays.
+      // Uses pre-rendered 16×16 (@1x) and 32×32 (@2x) PNGs instead of
+      // down-scaling the 1024×1024 app icon at runtime.
+      const dir = getIconsDir()
+      const trayIcon = nativeImage.createEmpty()
+      trayIcon.addRepresentation({
+        scaleFactor: 1.0,
+        width: 16,
+        height: 16,
+        buffer: readFileSync(join(dir, '16x16.png'))
+      })
+      trayIcon.addRepresentation({
+        scaleFactor: 2.0,
+        width: 32,
+        height: 32,
+        buffer: readFileSync(join(dir, '32x32.png'))
+      })
+      trayIcon.setTemplateImage(true)
+      return trayIcon
+    }
+
+    // Linux: load the main icon and resize to standard tray size
+    const ext = 'png'
+    const iconPath = app.isPackaged
+      ? join(process.resourcesPath, `icon.${ext}`)
+      : join(__dirname, `../../resources/icon.${ext}`)
+    return nativeImage.createFromPath(iconPath).resize({ width: 16, height: 16 })
+  }
+
+  const TASK_NAME = 'AtlasStartup'
+  /** The only arguments the startup task is allowed to carry — verified after registration. */
+  const TASK_ARGUMENTS = '--startup'
+
+  async function applyAutoLaunchWin32(enabled: boolean): Promise<void> {
+    // Use Task Scheduler with RunLevel HighestAvailable so the app starts
+    // elevated at logon. The HKCU Run key is NOT a viable fallback because
+    // the exe manifest is requireAdministrator — Windows silently skips
+    // Run-key entries for executables with an admin manifest.
+    const exePath = app.getPath('exe')
+
+    if (enabled) {
+      // Remove any stale task first, then create a fresh one
+      try {
+        await execNativeUtf8('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { timeout: 10000 })
+      } catch {
+        /* task may not exist yet */
+      }
+
+      // Build the task via XML so the /TR value is never subject to
+      // schtasks command-line quoting quirks (common cause of silent failures
+      // when the exe path contains spaces, e.g. "C:\Program Files\...").
+      const xml = [
+        '<?xml version="1.0" encoding="UTF-16"?>',
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+        '  <Triggers>',
+        '    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>',
+        '    <SessionStateChangeTrigger>',
+        '      <Enabled>true</Enabled>',
+        '      <StateChange>ConsoleConnect</StateChange>',
+        '    </SessionStateChangeTrigger>',
+        '  </Triggers>',
+        '  <Principals>',
+        '    <Principal id="Author">',
+        '      <LogonType>InteractiveToken</LogonType>',
+        '      <RunLevel>HighestAvailable</RunLevel>',
+        '    </Principal>',
+        '  </Principals>',
+        '  <Settings>',
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>',
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>',
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>',
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>',
+        '    <Enabled>true</Enabled>',
+        '  </Settings>',
+        '  <Actions Context="Author">',
+        `    <Exec>`,
+        `      <Command>${escapeXml(exePath)}</Command>`,
+        `      <Arguments>${escapeXml(TASK_ARGUMENTS)}</Arguments>`,
+        '    </Exec>',
+        '  </Actions>',
+        '</Task>'
+      ].join('\r\n')
+
+      // The XML lands in %LOCALAPPDATA%\Temp, which any process running as this
+      // user can write \u2014 including a non-elevated one. Since schtasks reads it
+      // back elevated and the task carries RunLevel HighestAvailable, a swap
+      // between our write and its read would register an attacker's command as a
+      // logon-triggered admin task. A random name denies the attacker a path to
+      // camp on, and the post-registration check below is what actually settles
+      // it: whatever ends up registered has to be the command we asked for.
+      const { writeFile, unlink, mkdtemp, rmdir } = await import('fs/promises')
+      const tmpDir = await mkdtemp(join(app.getPath('temp'), 'atlas-task-'))
+      const tmpPath = join(tmpDir, `${randomUUID()}.xml`)
+      await writeFile(tmpPath, '\uFEFF' + xml, 'utf-16le')
+
+      try {
+        await execNativeUtf8('schtasks', ['/Create', '/TN', TASK_NAME, '/XML', tmpPath, '/F'], {
+          timeout: 10000
+        })
+      } finally {
+        await unlink(tmpPath).catch(() => {})
+        await rmdir(tmpDir).catch(() => {})
+      }
+
+      // Verify what was actually registered, not merely that something was.
+      // If the definition isn't the one we submitted, the XML was tampered with
+      // in the window above \u2014 tear the task down rather than leave an elevated
+      // logon entry running something else.
+      //
+      // A query that fails or times out is also a failure to verify, and is
+      // treated the same way: an unverified elevated logon task must not survive
+      // this function, whatever the reason we couldn't check it.
+      let verified = false
+      try {
+        const { stdout: registered } = await execNativeUtf8(
+          'schtasks',
+          ['/Query', '/TN', TASK_NAME, '/XML', 'ONE'],
+          { timeout: 10000 }
+        )
+        verified = registeredTaskMatches(registered, exePath, TASK_ARGUMENTS)
+      } catch {
+        /* treated as unverified below */
+      }
+
+      if (!verified) {
+        await execNativeUtf8('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], {
+          timeout: 10000
+        }).catch(() => {})
+        throw new Error('Startup task verification failed \u2014 the registered task did not match')
+      }
+    } else {
+      try {
+        await execNativeUtf8('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { timeout: 10000 })
+      } catch {
+        /* task may not exist */
+      }
+    }
+
+    // Clear any leftover Electron Run-key entry so it doesn't conflict
+    app.setLoginItemSettings({ openAtLogin: false })
+  }
+
+  function escapeXml(s: string): string {
+    return s
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+  }
+
+  /**
+   * Is the registered task definition exactly the one we asked for?
+   *
+   * Task Scheduler runs the whole <Actions> block at HighestAvailable, so
+   * matching the command alone is not enough. Arguments decide what that command
+   * does — `--inspect-brk` would turn our own binary into arbitrary elevated code
+   * execution — and a definition may carry action types other than Exec
+   * (ComHandler, SendEmail, ShowMessage) that run without naming a command at
+   * all. So this requires precisely one Exec action, the expected command, the
+   * expected arguments, and no other action of any kind.
+   *
+   * Returns false on anything it cannot account for, so an unparseable or empty
+   * read is a failed verification rather than a pass.
+   */
+  function registeredTaskMatches(taskXml: string, exePath: string, expectedArgs: string): boolean {
+    const actionsBlock = taskXml.match(/<Actions\b[^>]*>([\s\S]*?)<\/Actions>/i)
+    if (!actionsBlock) return false
+    const actions = actionsBlock[1]
+
+    // Any element directly under <Actions> is an action. Exactly one, and it
+    // must be an Exec.
+    const actionTags = [...actions.matchAll(/<([A-Za-z][\w.-]*)\b/g)]
+      .map((m) => m[1])
+      .filter((tag) => !TASK_EXEC_CHILD_TAGS.has(tag))
+    if (actionTags.length !== 1 || actionTags[0].toLowerCase() !== 'exec') return false
+
+    const commands = [...actions.matchAll(/<Command>([\s\S]*?)<\/Command>/gi)]
+    if (commands.length !== 1) return false
+    const command = decodeXmlEntities(commands[0][1].trim().replace(/^"|"$/g, '')).toLowerCase()
+    if (command !== exePath.trim().toLowerCase()) return false
+
+    // Arguments may legitimately be absent only if we asked for none.
+    const argMatches = [...actions.matchAll(/<Arguments>([\s\S]*?)<\/Arguments>/gi)]
+    if (argMatches.length > 1) return false
+    const args = argMatches.length === 1 ? decodeXmlEntities(argMatches[0][1].trim()) : ''
+    return args === expectedArgs.trim()
+  }
+
+  /** Elements that appear *inside* an Exec action rather than being actions themselves. */
+  const TASK_EXEC_CHILD_TAGS = new Set(['Command', 'Arguments', 'WorkingDirectory'])
+
+  function decodeXmlEntities(s: string): string {
+    return s
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&amp;/g, '&')
+  }
+
+  async function applyAutoLaunch(enabled: boolean): Promise<void> {
+    // Only register auto-launch when packaged — in dev mode this would register
+    // the bare Electron binary, causing a generic "Getting Started" window on reboot.
+    if (!app.isPackaged) return
+    if (skipPortableStartup(enabled)) return
+
+    if (process.platform === 'win32') {
+      await applyAutoLaunchWin32(enabled)
+    } else {
+      app.setLoginItemSettings({
+        openAtLogin: enabled,
+        args: ['--startup']
+      })
+    }
+  }
+
+  function createTray(): void {
+    if (tray) return
+    // Elevated Linux GUIs often fall back to XEmbed via xembedsniproxy, which
+    // triggers Plasma Wayland "Remote Control" prompts on every tray click (#383).
+    if (process.platform === 'linux' && isAdmin()) return
+
+    tray = new Tray(createTrayIcon())
+    tray.setToolTip(t('trayTooltip'))
+
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: t('openAtlas'),
+        click: () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show()
+            mainWindow.focus()
+          } else {
+            createWindow()
+          }
+        }
+      },
+      { type: 'separator' },
+      {
+        label: t('quit'),
+        click: () => {
+          app.quit()
+        }
+      }
+    ])
+
+    tray.setContextMenu(contextMenu)
+    tray.on('double-click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.show()
+        mainWindow.focus()
+      } else {
+        createWindow()
+      }
+    })
+  }
+
+  /** Rebuild the tray context menu (e.g. after a language change) */
+  function rebuildTrayMenu(): void {
+    if (!tray) return
+    tray.setToolTip(t('trayTooltip'))
+    const contextMenu = Menu.buildFromTemplate([
+      {
+        label: t('openAtlas'),
+        click: () => {
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.show()
+            mainWindow.focus()
+          } else {
+            createWindow()
+          }
+        }
+      },
+      { type: 'separator' },
+      {
+        label: t('quit'),
+        click: () => {
+          app.quit()
+        }
+      }
+    ])
+    tray.setContextMenu(contextMenu)
+  }
+
+  function destroyTray(): void {
+    if (tray) {
+      tray.destroy()
+      tray = null
+    }
+  }
+
+  function createWindow(): void {
+    const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize
+    const defaultWidth = Math.round(screenWidth * 0.75)
+    const defaultHeight = Math.round(screenHeight * 0.8)
+
+    // Reopen at the size/position the user left the window at (issue #270).
+    const { width, height, x, y, isMaximized } = loadWindowState({
+      width: defaultWidth,
+      height: defaultHeight
+    })
+
+    const icon = nativeImage.createFromPath(getIconPath())
+
+    mainWindow = new BrowserWindow({
+      width,
+      height,
+      // Omitted when no saved position survived validation, so Electron centres.
+      ...(x !== undefined && y !== undefined ? { x, y } : {}),
+      minWidth: MIN_WINDOW_WIDTH,
+      minHeight: MIN_WINDOW_HEIGHT,
+      titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+      ...(process.platform !== 'darwin'
+        ? {
+            titleBarOverlay: {
+              color: '#00000000',
+              symbolColor: '#edf3ef',
+              height: 48
+            }
+          }
+        : {}),
+      ...(process.platform === 'win32' ? { backgroundMaterial: 'mica' as const } : {}),
+      roundedCorners: true,
+      backgroundColor: process.platform === 'win32' ? '#00000000' : '#071326',
+      icon,
+      show: false,
+      webPreferences: {
+        preload: join(__dirname, '../preload/index.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        // Chromium's renderer sandbox uses Linux namespaces that fail
+        // when running as root (e.g. after pkexec relaunch).  The
+        // --no-sandbox switch only covers the browser/GPU processes;
+        // this flag must also be false to prevent a blank grey window.
+        sandbox: !isRoot
+      }
+    })
+
+    if (process.platform === 'win32') {
+      // Respect the user's Windows accent preference for the native active-window border.
+      mainWindow.setAccentColor(true)
+    }
+
+    // Maximize before first paint so the window never flashes at its restored
+    // size; getNormalBounds() keeps the un-maximized geometry for later.
+    if (isMaximized) mainWindow.maximize()
+
+    trackWindowState(mainWindow)
+
+    const settings = getSettings()
+    // Detect startup launch: --startup flag (Windows Task Scheduler / Linux),
+    // or macOS wasOpenedAtLogin (since macOS 13+ drops argv from login items).
+    const isStartupLaunch =
+      process.argv.includes('--startup') ||
+      (process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin)
+
+    attachRendererDiagnostics(mainWindow)
+
+    // The external QA watchdog waits for the real renderer load event. This
+    // signal is only written in the isolated QA profile created by the runner.
+    mainWindow.webContents.once('did-finish-load', () => {
+      const readyFile = process.env['ATLAS_QA_READY_FILE']
+      if (!isQaSmoke || !readyFile || !isAbsolute(readyFile)) return
+      try {
+        writeFileSync(
+          readyFile,
+          JSON.stringify({ readyAt: new Date().toISOString(), pid: process.pid }),
+          'utf8'
+        )
+      } catch (error) {
+        console.error('Could not write QA readiness signal:', error)
+      }
+    })
+
+    mainWindow.on('ready-to-show', () => {
+      // If launched at startup with minimize-to-tray, stay hidden — only when a
+      // tray exists to restore the window (elevated Linux skips the tray, #383).
+      if (isStartupLaunch && settings.minimizeToTray && tray) {
+        // Don't show — just sit in tray
+      } else {
+        mainWindow?.show()
+      }
+    })
+
+    // Intercept close to minimize to tray if enabled
+    mainWindow.on('close', (e) => {
+      if (isQuitting) return
+      const currentSettings = getSettings()
+      if (currentSettings.minimizeToTray && tray && mainWindow && !mainWindow.isDestroyed()) {
+        e.preventDefault()
+        mainWindow.hide()
+      }
+    })
+
+    mainWindow.webContents.setWindowOpenHandler((details) => {
+      // Only allow opening HTTPS URLs externally
+      try {
+        const url = new URL(details.url)
+        if (url.protocol === 'https:') {
+          shell.openExternal(details.url)
+        }
+      } catch {
+        // Invalid URL, ignore
+      }
+      return { action: 'deny' }
+    })
+
+    // Register IPC handlers only once to avoid stacking on window recreation
+    if (!ipcRegistered) {
+      // Window control IPC — use current mainWindow reference
+      ipcMain.on(IPC.WINDOW_MINIMIZE, () => mainWindow?.minimize())
+      ipcMain.on(IPC.WINDOW_MAXIMIZE, () => {
+        if (mainWindow?.isMaximized()) {
+          mainWindow.unmaximize()
+        } else {
+          mainWindow?.maximize()
+        }
+      })
+      ipcMain.on(IPC.WINDOW_CLOSE, () => mainWindow?.close())
+      ipcMain.on(IPC.WINDOW_SET_CHROME_THEME, (_event, theme: unknown) => {
+        if (process.platform === 'darwin' || (theme !== 'light' && theme !== 'dark')) return
+        mainWindow?.setTitleBarOverlay({
+          color: '#00000000',
+          symbolColor: theme === 'light' ? '#17372f' : '#edf3ef',
+          height: 48
+        })
+      })
+
+      // Register all IPC handlers (pass getter so handlers always use current window)
+      registerCleanerIpc(() => mainWindow)
+
+      ipcMain.handle(IPC.EXTERNAL_TOOL_OPEN_SITE, async (event, rawId: unknown) => {
+        if (event.sender !== mainWindow?.webContents || typeof rawId !== 'string') return false
+        const tool = EXTERNAL_TOOLS.find((item) => item.id === rawId)
+        if (!tool) return false
+        await shell.openExternal(tool.siteUrl)
+        return true
+      })
+
+      ipcMain.handle(IPC.EXTERNAL_TOOL_DOWNLOAD, async (event, rawId: unknown) => {
+        if (event.sender !== mainWindow?.webContents || typeof rawId !== 'string') {
+          throw new Error('Solicitação inválida.')
+        }
+        if (process.platform !== 'win32') {
+          throw new Error('O download direto via PowerShell está disponível apenas no Windows.')
+        }
+
+        const tool = EXTERNAL_TOOLS.find((item) => item.id === rawId)
+        if (!tool?.releaseRepo || !tool.assetHint) {
+          throw new Error(
+            'Este projeto não publica um instalador compatível pelo GitHub. Abra o site oficial.'
+          )
+        }
+
+        const [owner, repository] = tool.releaseRepo.split('/')
+        if (
+          !owner ||
+          !repository ||
+          !/^[A-Za-z0-9_.-]+$/.test(owner) ||
+          !/^[A-Za-z0-9_.-]+$/.test(repository)
+        ) {
+          throw new Error('Configuração de projeto inválida.')
+        }
+        const repoPattern = `^https://github\\.com/${owner}/${repository}/releases/download/`
+        const assetHint = tool.assetHint.replace(/'/g, "''")
+        const repo = tool.releaseRepo.replace(/'/g, "''")
+        const downloadScript = `
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$release = Invoke-RestMethod -Headers @{ 'User-Agent' = 'Atlas-External-Tools' } -Uri 'https://api.github.com/repos/${repo}/releases/latest'
+$assets = @($release.assets | Where-Object { $_.name -match '${assetHint}' -and $_.name -match '\\.(exe|msi|msixbundle|zip|7z)$' -and $_.name -notmatch '(source|symbols|debug|checksum|sha256|\\.blockmap)' })
+if ($assets.Count -eq 0) { throw 'Não foi encontrado um arquivo de download compatível nesta versão. Abra o site oficial para escolher.' }
+$ranked = @($assets | ForEach-Object {
+  $score = 0
+  if ($_.name -match '\\.(exe|msi|msixbundle)$') { $score += 30 }
+  if ($_.name -match '(windows|win|x64|amd64|x86_64)') { $score += 10 }
+  if ($_.name -match '(arm|aarch64|x86_32|32bit)') { $score -= 20 }
+  [pscustomobject]@{ Asset = $_; Score = $score }
+} | Sort-Object -Property Score -Descending)
+$bestScore = $ranked[0].Score
+$best = @($ranked | Where-Object { $_.Score -eq $bestScore })
+if ($best.Count -ne 1) { throw 'O projeto publicou mais de um arquivo compatível. Abra o GitHub para escolher a versão correta.' }
+$asset = $best[0].Asset
+if ($asset.browser_download_url -notmatch '${repoPattern}') { throw 'O endereço do arquivo não corresponde ao repositório oficial esperado.' }
+if ($asset.name -match '[\\\\/]' -or $asset.size -le 0) { throw 'O projeto publicou um nome ou tamanho de arquivo inválido.' }
+$directory = Join-Path $env:USERPROFILE 'Downloads\\Atlas-Tools'
+[System.IO.Directory]::CreateDirectory($directory) | Out-Null
+$path = Join-Path $directory $asset.name
+$base = [System.IO.Path]::GetFileNameWithoutExtension($asset.name)
+$extension = [System.IO.Path]::GetExtension($asset.name)
+$counter = 1
+while (Test-Path -LiteralPath $path) { $path = Join-Path $directory ($base + '-' + $counter + $extension); $counter++ }
+Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $path
+if ((Get-Item -LiteralPath $path).Length -ne [long]$asset.size) { Remove-Item -LiteralPath $path -Force; throw 'O tamanho baixado não corresponde ao informado pelo GitHub; o arquivo foi removido.' }
+Write-Output $path
+`
+        const encodedScript = Buffer.from(downloadScript, 'utf16le').toString('base64')
+        const { stdout } = await execFileAsync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedScript],
+          { timeout: 180_000, maxBuffer: 1024 * 1024, windowsHide: true }
+        )
+        const downloadedPath = stdout.trim().split(/\r?\n/).at(-1)
+        if (!downloadedPath || !isAbsolute(downloadedPath)) {
+          throw new Error('O PowerShell terminou sem informar onde salvou o arquivo.')
+        }
+        return { path: downloadedPath }
+      })
+
+      ipcRegistered = true
+    }
+
+    // Load the app
+    if (process.env['ELECTRON_RENDERER_URL']) {
+      mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    } else {
+      mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    }
+  }
+
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      if (!mainWindow.isVisible()) mainWindow.show()
+      mainWindow.focus()
+    }
+  })
+
+  app.whenReady().then(() => {
+    // On macOS, ensure the Dock icon is visible.  When relaunched as root
+    // via osascript the binary is executed directly (not through `open` /
+    // LaunchServices), so the Dock icon won't appear automatically.
+    if (process.platform === 'darwin' && app.dock) {
+      app.dock.show()
+    }
+
+    // Ensure an Edit menu exists so clipboard shortcuts (Cmd+C/V/X on macOS,
+    // Ctrl+C/V/X elsewhere) work in the frameless window.  On macOS Cmd+V
+    // relies on an Edit menu with the paste role — without an explicit menu
+    // the shortcuts break when the app is relaunched as root.
+    // We preserve the default appMenu role so Cmd+Q, Cmd+H, About, etc. stay.
+    const appMenu = Menu.buildFromTemplate([
+      { role: 'appMenu' },
+      {
+        label: 'Edit',
+        submenu: [
+          { role: 'undo' },
+          { role: 'redo' },
+          { type: 'separator' },
+          { role: 'cut' },
+          { role: 'copy' },
+          { role: 'paste' },
+          { role: 'selectAll' }
+        ]
+      }
+    ])
+    Menu.setApplicationMenu(appMenu)
+
+    const settings = getSettings()
+
+    // Apply auto-launch setting
+    if (!isQaSmoke) {
+      applyAutoLaunch(settings.runAtStartup).catch((err) => {
+        console.error('Failed to configure auto-launch:', err)
+      })
+    }
+
+    // Create tray if minimize-to-tray is enabled or any schedule is active
+    if (settings.minimizeToTray || settings.schedules.some((s) => s.enabled)) {
+      createTray()
+    }
+
+    createWindow()
+
+    // Initialize auto-updater
+    if (!isQaSmoke) initAutoUpdater()
+
+    // Start the scheduled scan checker
+    if (!isQaSmoke) {
+      startScheduler(() => mainWindow)
+      startStorageHistory()
+    }
+
+    // Listen for settings changes to update auto-launch and tray
+    ipcMain.handle(IPC.SETTINGS_APPLY_STARTUP, async (_event, enabled: boolean) => {
+      if (!isQaSmoke) await applyAutoLaunch(enabled)
+    })
+
+    ipcMain.on(IPC.SETTINGS_APPLY_TRAY, (_event, enabled: boolean) => {
+      if (enabled) {
+        createTray()
+      } else if (!getSettings().schedules.some((s) => s.enabled)) {
+        destroyTray()
+      }
+    })
+
+    // Rebuild tray menu when language changes so labels update immediately
+    app.on('atlas:language-changed' as any, () => {
+      rebuildTrayMenu()
+    })
+
+    // IPC to get next scan time for the UI
+    ipcMain.handle(IPC.SCHEDULE_NEXT_SCAN, () => {
+      const s = getSettings()
+      const next = getNextScanTime(s)
+      return next ? next.toISOString() : null
+    })
+
+    // Handle scheduled scan completion notification from renderer
+    ipcMain.on(IPC.SCHEDULE_SCAN_COMPLETE, (_event, totalSize: number, itemCount: number) => {
+      notifyScheduledScanComplete(totalSize, itemCount)
+    })
+
+    ipcMain.handle(IPC.SCHEDULE_AUTHORIZE, (_event, id: unknown, runId: unknown) =>
+      authorizeScheduleStep(id, runId)
+    )
+    ipcMain.handle(IPC.SCHEDULE_RUN_ACK, (_event, id: unknown, runId: unknown) =>
+      acknowledgeScheduleRun(id, runId)
+    )
+    ipcMain.handle(IPC.SCHEDULE_RUNTIME, () => getScheduleRuntime())
+    ipcMain.handle(IPC.SCHEDULE_RUN_NOW, (_event, id: unknown) =>
+      runScheduleNow(() => mainWindow, id)
+    )
+    // Handle multi-schedule run completion
+    const VALID_RUN_STATUSES = new Set([
+      'success',
+      'partial',
+      'failed',
+      'never',
+      'skipped',
+      'deferred'
+    ])
+    ipcMain.handle(
+      IPC.SCHEDULE_RUN_COMPLETE,
+      (_event, scheduleId: unknown, status: unknown, runId: unknown) => {
+        if (typeof scheduleId !== 'string' || typeof status !== 'string') return
+        if (!VALID_RUN_STATUSES.has(status)) return
+        if (typeof runId === 'string')
+          return completeScheduleRun(
+            scheduleId,
+            status as 'success' | 'partial' | 'failed' | 'never' | 'skipped' | 'deferred',
+            runId
+          )
+      }
+    )
+
+    app.on('activate', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        // Window exists but may be hidden (minimize-to-tray) — restore it
+        mainWindow.show()
+        mainWindow.focus()
+      } else if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow()
+      }
+    })
+  })
+
+  app.on('window-all-closed', () => {
+    const settings = getSettings()
+    // Stay alive for schedules even without a tray (elevated Linux skips tray).
+    // Minimize-to-tray alone must not keep a headless process when tray is missing.
+    const trayActive = tray != null
+    if ((trayActive && settings.minimizeToTray) || settings.schedules.some((s) => s.enabled)) {
+      // Stay alive for tray and/or background schedules
+      return
+    }
+    if (process.platform !== 'darwin') {
+      app.quit()
+    }
+  })
+
+  // On macOS, autoUpdater.quitAndInstall() closes all windows *before* emitting
+  // before-quit, so mark quitting from this earlier signal too
+  // 'before-quit-for-update' isn't in Electron's typed event map
+  const appEvents = app as unknown as NodeJS.EventEmitter
+  appEvents.on('before-quit-for-update', () => {
+    isQuitting = true
+  })
+
+  app.on('before-quit', () => {
+    isQuitting = true
+    stopScheduler()
+    stopStorageHistory()
+    // Kill any active child processes (reg.exe, cmd.exe, etc.) to prevent orphans
+    killAllChildren()
+  })
+} // end initGui

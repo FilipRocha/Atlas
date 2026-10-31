@@ -1,0 +1,43 @@
+{
+  "pageTitle": "Tools & setup",
+  "pageDescription": "Trusted maintenance programs and a checklist for after reinstalling Windows.",
+  "catalogTitle": "Maintenance tools",
+  "catalogDescription": "Open the official project page or download a published release. Downloads are never installed or run automatically.",
+  "searchPlaceholder": "Search tools",
+  "noResults": "No tools match your search.",
+  "downloadDirect": "Download directly",
+  "downloading": "Downloading…",
+  "openGithub": "GitHub page",
+  "openOfficialSite": "Official site",
+  "downloadUnavailable": "Direct download is not available here; use the official site.",
+  "windowsOnlyDownload": "PowerShell downloads are available on Windows only.",
+  "downloadSuccess": "Downloaded to {{path}}",
+  "downloadError": "The download could not be completed.",
+  "siteError": "The official page could not be opened.",
+  "safetyNote": "Downloads use the official release source when available. Atlas checks the project and file size, saves the file under Downloads/Atlas-Tools, and never runs the file.",
+  "categories": {
+    "apps": "Apps and Windows settings",
+    "cleanup": "Cleanup",
+    "storage": "Storage and files",
+    "diagnostics": "Diagnostics",
+    "backup": "Backup",
+    "recovery": "Recovery",
+    "network": "Network"
+  },
+  "checklist": {
+    "title": "After reinstalling Windows",
+    "description": "Mark each step as you complete it. Your checklist is saved on this computer.",
+    "saveError": "The checklist could not be saved.",
+    "items": [
+      "Activate Windows and confirm the installed edition matches your license.",
+      "Install Windows updates and restart when prompted.",
+      "Install drivers from Windows Update or your computer manufacturer's website.",
+      "Install the essential apps you use every day.",
+      "Update Windows Security and run a scan.",
+      "Create a restore point before changing system settings.",
+      "Back up documents to another drive or cloud storage.",
+      "Prepare recovery media on an empty USB drive.",
+      "Check internet, audio, Bluetooth, printer, and Device Manager."
+    ]
+  }
+}

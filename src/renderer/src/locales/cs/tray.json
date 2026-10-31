@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Ukončit",
+  "scheduledTaskNotificationTitle": "Atlas – Naplánovaná úloha",
+  "scheduledTaskNotificationBody": "Spouští se „{{name}}“…",
+  "scanCompleteNotificationTitle": "Atlas – Kontrola dokončena",
+  "scanCompleteNotificationBody": "Bylo nalezeno {{itemCount}} položek ({{sizeMB}} MB), které lze vyčistit.",
+  "scheduledScanName": "Naplánovaná kontrola",
+  "openAtlas": "Otevřít Atlas"
+}

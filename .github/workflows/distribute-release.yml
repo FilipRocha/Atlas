@@ -1,0 +1,166 @@
+name: Release - Distribute
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag to distribute
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      WEB_DEPLOY_HOOK:
+        required: true
+      VIRUSTOTAL_API_KEY:
+        required: true
+      WINGET_GH_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag }}
+
+concurrency:
+  group: distribute-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-release:
+    name: Verify Published Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require a published stable release before distribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node <<'NODE'
+          const assert = require('node:assert/strict')
+          const { execFileSync } = require('node:child_process')
+          const tag = process.env.RELEASE_TAG
+          assert.match(tag, /^v\d+\.\d+\.\d+$/)
+          const release = JSON.parse(execFileSync('gh', [
+            'api', `repos/${process.env.GITHUB_REPOSITORY}/releases/tags/${tag}`
+          ], { encoding: 'utf8' }))
+          assert.equal(release.tag_name, tag)
+          assert.equal(release.draft, false, 'Cannot distribute a draft')
+          assert.equal(release.prerelease, false, 'Expected a stable release')
+          assert(release.assets.length > 0, 'Release must contain uploaded assets')
+          assert(release.assets.every(asset => asset.state === 'uploaded' && asset.size > 0))
+          console.log(`Verified published release ${tag}`)
+          NODE
+
+  deploy-website:
+    name: Deploy Website
+    needs: verify-release
+    uses: ./.github/workflows/deploy-website.yml
+    secrets:
+      WEB_DEPLOY_HOOK: ${{ secrets.WEB_DEPLOY_HOOK }}
+
+  virustotal-scan:
+    name: Submit to VirusTotal
+    needs: verify-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Get version from tag
+        id: version
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download release artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          gh release download "v$version" --repo "${{ github.repository }}" --pattern "Atlas-Setup-*.exe" --pattern "Atlas-Portable-*.exe" --pattern "Atlas-*.dmg" --pattern "Atlas-*.AppImage" --pattern "Atlas-*.deb" --dir artifacts/
+
+      - name: Scan with VirusTotal
+        env:
+          VT_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}
+        run: |
+          results=""
+          for file in artifacts/*; do
+            filename=$(basename "$file")
+            filesize=$(stat -c%s "$file")
+            echo "Uploading $filename ($filesize bytes) to VirusTotal..."
+
+            if [ "$filesize" -gt 33554432 ]; then
+              # Files > 32MB need the large-file upload URL
+              echo "  Using large-file upload flow..."
+              upload_url=$(curl -s --request GET \
+                --url "https://www.virustotal.com/api/v3/files/upload_url" \
+                --header "x-apikey: $VT_API_KEY" | jq -r '.data')
+            else
+              upload_url="https://www.virustotal.com/api/v3/files"
+            fi
+
+            response=$(curl -s --request POST \
+              --url "$upload_url" \
+              --header "x-apikey: $VT_API_KEY" \
+              --form "file=@$file")
+            analysis_id=$(echo "$response" | jq -r '.data.id')
+            if [ "$analysis_id" != "null" ] && [ -n "$analysis_id" ]; then
+              echo "  Analysis ID: $analysis_id"
+              results="$results- **$filename**: https://www.virustotal.com/gui/file-analysis/$analysis_id\n"
+            else
+              echo "  Failed to upload: $response"
+              results="$results- **$filename**: upload failed\n"
+            fi
+            # VirusTotal free API rate limit: 4 requests/minute
+            sleep 20
+          done
+
+          echo "## VirusTotal Scan Results" > vt_report.md
+          echo "" >> vt_report.md
+          echo -e "$results" >> vt_report.md
+
+      - name: Append scan results to release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          existing=$(gh release view "v$version" --repo "${{ github.repository }}" --json body -q .body)
+          vt_report=$(cat vt_report.md)
+          gh release edit "v$version" --repo "${{ github.repository }}" --notes "${existing}
+
+          ${vt_report}"
+
+  publish-winget:
+    name: Submit WinGet Manifest
+    needs: verify-release
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Get version from tag
+        id: version
+        shell: bash
+        run: echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync winget-pkgs fork with upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.WINGET_GH_TOKEN }}
+        run: |
+          fork_owner=$(gh api user -q .login)
+          gh repo sync "$fork_owner/winget-pkgs" --source microsoft/winget-pkgs --force
+
+      - name: Update winget manifest
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $url = "${{ github.server_url }}/${{ github.repository }}/releases/download/v$version/Atlas-Setup-$version.exe"
+          $releaseNotesUrl = "${{ github.server_url }}/${{ github.repository }}/releases/tag/v$version"
+          Invoke-WebRequest -Uri "https://aka.ms/wingetcreate/latest" -OutFile wingetcreate.exe
+          .\wingetcreate.exe update AdventDevelopmentInc.Atlas --submit --token "${{ secrets.WINGET_GH_TOKEN }}" --urls "$url|x64|machine" --version $version --release-notes-url $releaseNotesUrl

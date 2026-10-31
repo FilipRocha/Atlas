@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Avsluta",
+  "scheduledTaskNotificationTitle": "Atlas - Schemalagd aktivitet",
+  "scheduledTaskNotificationBody": "Kör \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Genomsökning slutförd",
+  "scanCompleteNotificationBody": "Hittade {{itemCount}} objekt ({{sizeMB}} MB) som kan rensas.",
+  "scheduledScanName": "Schemalagd genomsökning",
+  "openAtlas": "Öppna Atlas"
+}

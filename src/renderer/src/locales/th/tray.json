@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "ออก",
+  "scheduledTaskNotificationTitle": "Atlas - งานที่กำหนดเวลาไว้",
+  "scheduledTaskNotificationBody": "กำลังเรียกใช้ \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - การสแกนเสร็จสมบูรณ์",
+  "scanCompleteNotificationBody": "พบ {{itemCount}} รายการ ({{sizeMB}} MB) ที่สามารถล้างได้",
+  "scheduledScanName": "การสแกนตามกำหนดเวลา",
+  "openAtlas": "เปิด Atlas"
+}

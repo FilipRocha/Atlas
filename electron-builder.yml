@@ -1,0 +1,125 @@
+appId: com.atlas.app
+productName: Atlas
+copyright: Copyright © 2024-2026 Atlas Contributors
+
+directories:
+  buildResources: resources
+  output: dist
+
+files:
+  - out/**/*
+
+# Archive a separate copy so the portable marker never enters the installer.
+afterAllArtifactBuild: scripts/build-portable-zip.js
+
+extraResources:
+  - from: resources/icon.ico
+    to: icon.ico
+    filter:
+      - "**/*"
+  - from: resources/icon.png
+    to: icon.png
+    filter:
+      - "**/*"
+  - from: resources/icons
+    to: icons
+    filter:
+      - "**/*"
+      - "!tray/master.png"
+      - "!tray/montage.png"
+  - from: resources/hardware-bridge
+    to: hardware-bridge
+    filter:
+      - "**/*"
+win:
+  extraResources:
+    - from: resources/hardware-bridge
+      to: hardware-bridge
+      filter:
+        - "**/*"
+    - from: resources/winget/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle
+      to: winget/Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle
+  files:
+    - native/process-monitor/build/Release/atlas_process_monitor.node
+  asarUnpack:
+    - native/process-monitor/build/Release/atlas_process_monitor.node
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: portable
+      arch:
+        - x64
+  icon: resources/icon.ico
+  requestedExecutionLevel: requireAdministrator
+
+nsis:
+  oneClick: true
+  # Must stay in sync with win.requestedExecutionLevel above.
+  # requestedExecutionLevel only patches the manifest of Atlas.exe — it has no
+  # effect on the installer. Left per-user (the default), the installer compiles
+  # with `RequestExecutionLevel user`, so it never elevates and then drops an
+  # admin-manifested exe into the user-writable %LOCALAPPDATA%\Programs. Going
+  # per-machine makes the installer request elevation up front, installs to
+  # Program Files, and marks isAdminRightsRequired in the update metadata.
+  perMachine: true
+  allowToChangeInstallationDirectory: false
+  deleteAppDataOnUninstall: false
+  shortcutName: Atlas
+  artifactName: Atlas-Setup-${version}.${ext}
+
+portable:
+  artifactName: Atlas-Portable-${version}.${ext}
+  requestExecutionLevel: admin
+
+mac:
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  icon: resources/icon.png
+  category: public.app-categories.utilities
+  hardenedRuntime: true
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  notarize: true
+  artifactName: Atlas-${version}-${arch}.${ext}
+
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+        - arm64
+    - target: deb
+      arch:
+        - x64
+        - arm64
+  icon: resources/icons/
+  category: Utility
+
+# Stable AppImage name so electron-updater overwrites in place (#401).
+# A versioned basename makes doInstall delete the old file and write a new
+# name, leaving desktop/menu Exec= paths pointing at a missing binary.
+appImage:
+  artifactName: Atlas-${arch}.${ext}
+
+deb:
+  artifactName: Atlas-${version}-${arch}.${ext}
+  depends:
+    - libgtk-3-0
+    - libnss3
+    - libxss1
+    - libasound2 | libasound2t64
+    - libgbm1
+    - libfuse2 | libfuse2t64
+  afterInstall: scripts/deb-postinstall.sh
+
+publish:
+  provider: github
+  releaseType: release

@@ -1,0 +1,1384 @@
+import { useEffect, useState, useMemo } from 'react'
+import { CleanupReceipts } from '@/components/cleaner/CleanupReceipts'
+import { useSearchParams } from 'react-router-dom'
+import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+import {
+  History,
+  Sparkles,
+  Database,
+  PackageMinus,
+  Trash2,
+  Info,
+  TrendingUp,
+  HardDrive,
+  BarChart3,
+  Clock,
+  AlertCircle,
+  Wifi,
+  Cpu,
+  ShieldCheck,
+  Bug,
+  Zap,
+  Settings2,
+  RefreshCw,
+  FileText,
+  Download,
+  FolderOpen,
+  CheckCircle2,
+  XCircle
+} from 'lucide-react'
+import {
+  AreaChart,
+  Area,
+  BarChart,
+  Bar,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid
+} from 'recharts'
+import { PageHeader } from '@/components/layout/PageHeader'
+import { EmptyState } from '@/components/shared/EmptyState'
+import { ConfirmDialog } from '@/components/shared/ConfirmDialog'
+import { useHistoryStore } from '@/stores/history-store'
+import { formatBytes } from '@/lib/utils'
+import { usePlatform } from '@/hooks/usePlatform'
+import type { ScanHistoryEntry, HistoryEntryType, DeletedFileRecord } from '@shared/types'
+
+const typeConfigBase: Record<
+  HistoryEntryType,
+  { labelKey: string; icon: typeof Sparkles; color: string; bg: string }
+> = {
+  cleaner: {
+    labelKey: 'typeLabels.cleaner',
+    icon: Sparkles,
+    color: '#f59e0b',
+    bg: 'rgba(245,158,11,0.1)'
+  },
+  registry: {
+    labelKey: 'typeLabels.registry',
+    icon: Database,
+    color: '#3b82f6',
+    bg: 'rgba(59,130,246,0.1)'
+  },
+  debloater: {
+    labelKey: 'typeLabels.debloater',
+    icon: PackageMinus,
+    color: '#a855f7',
+    bg: 'rgba(168,85,247,0.1)'
+  },
+  network: {
+    labelKey: 'typeLabels.network',
+    icon: Wifi,
+    color: '#22c55e',
+    bg: 'rgba(34,197,94,0.1)'
+  },
+  drivers: {
+    labelKey: 'typeLabels.drivers',
+    icon: Cpu,
+    color: '#8b5cf6',
+    bg: 'rgba(139,92,246,0.1)'
+  },
+  malware: {
+    labelKey: 'typeLabels.malware',
+    icon: Bug,
+    color: '#ef4444',
+    bg: 'rgba(239,68,68,0.1)'
+  },
+  privacy: {
+    labelKey: 'typeLabels.privacy',
+    icon: ShieldCheck,
+    color: '#14b8a6',
+    bg: 'rgba(20,184,166,0.1)'
+  },
+  startup: {
+    labelKey: 'typeLabels.startup',
+    icon: Zap,
+    color: '#f97316',
+    bg: 'rgba(249,115,22,0.1)'
+  },
+  services: {
+    labelKey: 'typeLabels.services',
+    icon: Settings2,
+    color: '#6366f1',
+    bg: 'rgba(99,102,241,0.1)'
+  },
+  'software-update': {
+    labelKey: 'typeLabels.softwareUpdate',
+    icon: RefreshCw,
+    color: '#06b6d4',
+    bg: 'rgba(6,182,212,0.1)'
+  }
+}
+
+function useTypeConfig() {
+  const { t } = useTranslation('history')
+  return useMemo(() => {
+    const result = {} as Record<
+      HistoryEntryType,
+      { label: string; icon: typeof Sparkles; color: string; bg: string }
+    >
+    for (const [key, val] of Object.entries(typeConfigBase)) {
+      result[key as HistoryEntryType] = { ...val, label: t(val.labelKey) }
+    }
+    return result
+  }, [t])
+}
+
+const PIE_COLORS = [
+  '#f59e0b',
+  '#3b82f6',
+  '#22c55e',
+  '#a855f7',
+  '#ec4899',
+  '#14b8a6',
+  '#ef4444',
+  '#6366f1'
+]
+
+type ViewMode = 'overview' | 'timeline' | 'receipts'
+
+export function HistoryPage() {
+  const [searchParams] = useSearchParams()
+  const { t } = useTranslation('history')
+  const typeConfig = useTypeConfig()
+  const { entries, loaded, load, clear } = useHistoryStore()
+  const [showClearConfirm, setShowClearConfirm] = useState(false)
+  const [selectedEntry, setSelectedEntry] = useState<string | null>(null)
+  const [viewMode, setViewMode] = useState<ViewMode>(
+    searchParams.get('view') === 'receipts' ? 'receipts' : 'overview'
+  )
+  const [typeFilter, setTypeFilter] = useState<'all' | ScanHistoryEntry['type']>('all')
+
+  useEffect(() => {
+    load()
+  }, [])
+
+  const filtered = useMemo(
+    () => (typeFilter === 'all' ? entries : entries.filter((e) => e.type === typeFilter)),
+    [entries, typeFilter]
+  )
+
+  // --- Aggregated stats ---
+  const stats = useMemo(() => {
+    const totalSpace = entries.reduce((s, e) => s + e.totalSpaceSaved, 0)
+    const totalItems = entries.reduce((s, e) => s + e.totalItemsCleaned, 0)
+    const totalErrors = entries.reduce((s, e) => s + e.errorCount, 0)
+    const avgDuration =
+      entries.length > 0 ? entries.reduce((s, e) => s + e.duration, 0) / entries.length : 0
+    return { totalSpace, totalItems, totalErrors, avgDuration, totalScans: entries.length }
+  }, [entries])
+
+  // --- Chart data: space saved over time (grouped by day, last 30 days with data) ---
+  const timelineData = useMemo(() => {
+    const byDay: Record<string, { space: number; items: number }> = {}
+    for (const e of filtered) {
+      const key = new Date(e.timestamp).toLocaleDateString(undefined, {
+        month: 'short',
+        day: 'numeric'
+      })
+      if (!byDay[key]) byDay[key] = { space: 0, items: 0 }
+      byDay[key].space += e.totalSpaceSaved
+      byDay[key].items += e.totalItemsCleaned
+    }
+    return Object.entries(byDay)
+      .slice(0, 30)
+      .reverse()
+      .map(([date, d]) => ({ date, space: d.space, items: d.items }))
+  }, [filtered])
+
+  // --- Chart data: breakdown by scan type ---
+  const typeBreakdown = useMemo(() => {
+    const byType: Record<string, { count: number; space: number; items: number }> = {}
+    for (const e of entries) {
+      const label = typeConfig[e.type].label
+      if (!byType[label]) byType[label] = { count: 0, space: 0, items: 0 }
+      byType[label].count++
+      byType[label].space += e.totalSpaceSaved
+      byType[label].items += e.totalItemsCleaned
+    }
+    return Object.entries(byType).map(([name, d]) => ({ name, ...d }))
+  }, [entries, typeConfig])
+
+  // --- Chart data: category breakdown across all scans ---
+  const categoryBreakdown = useMemo(() => {
+    const byCategory: Record<string, { items: number; space: number }> = {}
+    for (const e of entries) {
+      for (const c of e.categories) {
+        if (!byCategory[c.name]) byCategory[c.name] = { items: 0, space: 0 }
+        byCategory[c.name].items += c.itemsCleaned
+        byCategory[c.name].space += c.spaceSaved
+      }
+    }
+    return Object.entries(byCategory)
+      .map(([name, d]) => ({ name, ...d }))
+      .sort((a, b) => b.space - a.space || b.items - a.items)
+      .slice(0, 8)
+  }, [entries])
+
+  // --- Weekly trend data ---
+  const weeklyData = useMemo(() => {
+    const weeks: Record<string, { space: number; items: number; count: number }> = {}
+    for (const e of entries) {
+      const d = new Date(e.timestamp)
+      const weekStart = new Date(d)
+      weekStart.setDate(d.getDate() - d.getDay())
+      const key = weekStart.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+      if (!weeks[key]) weeks[key] = { space: 0, items: 0, count: 0 }
+      weeks[key].space += e.totalSpaceSaved
+      weeks[key].items += e.totalItemsCleaned
+      weeks[key].count++
+    }
+    return Object.entries(weeks)
+      .slice(0, 12)
+      .reverse()
+      .map(([week, d]) => ({ week, ...d }))
+  }, [entries])
+
+  if (!loaded) return null
+
+  if (entries.length === 0 && viewMode !== 'receipts') {
+    return (
+      <div className="animate-fade-in">
+        <PageHeader
+          title={t('pageTitle')}
+          description={t('pageDescription')}
+          action={
+            <button className="feature-button" onClick={() => setViewMode('receipts')}>
+              {t('receipts.title')}
+            </button>
+          }
+        />
+        <EmptyState
+          icon={History}
+          title={t('emptyStateTitle')}
+          description={t('emptyStateDescription')}
+        />
+      </div>
+    )
+  }
+
+  return (
+    <div className="animate-fade-in">
+      <PageHeader
+        title={t('pageTitle')}
+        description={t('pageDescription')}
+        action={
+          <div className="flex items-center gap-2.5">
+            {/* View mode toggle */}
+            <div
+              className="flex rounded-xl overflow-hidden"
+              style={{ border: '1px solid var(--border-medium)' }}
+            >
+              <button
+                onClick={() => setViewMode('overview')}
+                className="px-4 py-2 text-[12px] font-medium transition-colors"
+                style={{
+                  background:
+                    viewMode === 'overview' ? 'var(--accent-muted-bg)' : 'var(--bg-subtle)',
+                  color: viewMode === 'overview' ? 'var(--accent)' : 'var(--text-muted)'
+                }}
+              >
+                {t('viewOverview')}
+              </button>
+              <button
+                onClick={() => setViewMode('timeline')}
+                className="px-4 py-2 text-[12px] font-medium transition-colors"
+                style={{
+                  background:
+                    viewMode === 'timeline' ? 'var(--accent-muted-bg)' : 'var(--bg-subtle)',
+                  color: viewMode === 'timeline' ? 'var(--accent)' : 'var(--text-muted)'
+                }}
+              >
+                {t('viewTimeline')}
+              </button>
+              <button
+                onClick={() => setViewMode('receipts')}
+                className="px-4 py-2 text-[12px] font-medium"
+                aria-pressed={viewMode === 'receipts'}
+                style={{
+                  background:
+                    viewMode === 'receipts' ? 'var(--accent-muted-bg)' : 'var(--bg-subtle)',
+                  color: viewMode === 'receipts' ? 'var(--accent)' : 'var(--text-muted)'
+                }}
+              >
+                {t('receipts.title')}
+              </button>
+            </div>
+            {viewMode !== 'receipts' && (
+              <button
+                onClick={() => setShowClearConfirm(true)}
+                className="flex items-center gap-2 rounded-xl px-4 py-2.5 text-[13px] font-medium text-zinc-500 transition-all hover:text-zinc-300"
+                style={{ background: 'var(--bg-subtle)', border: '1px solid var(--border-medium)' }}
+              >
+                <Trash2 className="h-3.5 w-3.5" strokeWidth={1.8} />
+                {t('clearButton')}
+              </button>
+            )}
+          </div>
+        }
+      />
+
+      {viewMode === 'receipts' ? (
+        <CleanupReceipts />
+      ) : viewMode === 'overview' ? (
+        <OverviewView
+          stats={stats}
+          timelineData={timelineData}
+          typeBreakdown={typeBreakdown}
+          categoryBreakdown={categoryBreakdown}
+          weeklyData={weeklyData}
+          entries={entries}
+        />
+      ) : viewMode === 'timeline' ? (
+        <TimelineView
+          entries={filtered}
+          typeFilter={typeFilter}
+          setTypeFilter={setTypeFilter}
+          selectedEntry={selectedEntry}
+          setSelectedEntry={setSelectedEntry}
+          typeConfig={typeConfig}
+        />
+      ) : null}
+
+      <ConfirmDialog
+        open={showClearConfirm}
+        onConfirm={() => {
+          clear()
+          setShowClearConfirm(false)
+        }}
+        onCancel={() => setShowClearConfirm(false)}
+        title={t('confirmClearScanTitle')}
+        description={t('confirmClearScanDescription')}
+        confirmLabel={t('confirmClearLabel')}
+        variant="danger"
+      />
+    </div>
+  )
+}
+
+// ============ Overview View ============
+
+function OverviewView({
+  stats,
+  timelineData,
+  typeBreakdown,
+  categoryBreakdown,
+  weeklyData,
+  entries
+}: {
+  stats: {
+    totalSpace: number
+    totalItems: number
+    totalErrors: number
+    avgDuration: number
+    totalScans: number
+  }
+  timelineData: { date: string; space: number; items: number }[]
+  typeBreakdown: { name: string; count: number; space: number; items: number }[]
+  categoryBreakdown: { name: string; items: number; space: number }[]
+  weeklyData: { week: string; space: number; items: number; count: number }[]
+  entries: ScanHistoryEntry[]
+}) {
+  const { t } = useTranslation('history')
+  return (
+    <>
+      {/* Summary stat cards */}
+      <div className="mb-5 grid grid-cols-4 gap-3">
+        <MiniStat
+          icon={BarChart3}
+          label={t('overview.totalScans')}
+          value={stats.totalScans.toString()}
+          color="#f59e0b"
+        />
+        <MiniStat
+          icon={HardDrive}
+          label={t('overview.spaceRecovered')}
+          value={formatBytes(stats.totalSpace)}
+          color="#22c55e"
+        />
+        <MiniStat
+          icon={TrendingUp}
+          label={t('overview.itemsProcessed')}
+          value={stats.totalItems.toLocaleString()}
+          color="#3b82f6"
+        />
+        <MiniStat
+          icon={Clock}
+          label={t('overview.avgDuration')}
+          value={formatDuration(stats.avgDuration, t)}
+          color="#a855f7"
+        />
+      </div>
+
+      {/* Charts row 1 — Area chart + Pie chart */}
+      <div className="mb-5 grid grid-cols-3 gap-4">
+        {/* Space saved over time */}
+        <div
+          className="col-span-2 rounded-2xl p-5"
+          style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+        >
+          <h3
+            className="mb-4 text-[12px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            {t('overview.spaceRecoveredOverTime')}
+          </h3>
+          {timelineData.length > 1 ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <AreaChart data={timelineData}>
+                <defs>
+                  <linearGradient id="spaceGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.3} />
+                    <stop offset="100%" stopColor="#f59e0b" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--grid-line)" />
+                <XAxis
+                  dataKey="date"
+                  tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <YAxis
+                  tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                  tickFormatter={(v) => formatBytes(v, 0)}
+                  width={60}
+                />
+                <Tooltip
+                  contentStyle={{
+                    background: 'var(--card-bg)',
+                    border: '1px solid var(--border-stronger)',
+                    borderRadius: 12,
+                    fontSize: 12
+                  }}
+                  labelStyle={{ color: 'var(--text-secondary)' }}
+                  formatter={(value) => [formatBytes(Number(value)), t('overview.tooltipSpace')]}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="space"
+                  stroke="#f59e0b"
+                  strokeWidth={2}
+                  fill="url(#spaceGrad)"
+                  dot={false}
+                  activeDot={{ r: 4, fill: '#f59e0b' }}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div
+              className="flex h-[220px] items-center justify-center text-[13px]"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {t('overview.needTwoScansForChart')}
+            </div>
+          )}
+        </div>
+
+        {/* Scan type distribution */}
+        <div
+          className="rounded-2xl p-5"
+          style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+        >
+          <h3
+            className="mb-4 text-[12px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            {t('overview.scanTypeDistribution')}
+          </h3>
+          {typeBreakdown.length > 0 ? (
+            <>
+              <ResponsiveContainer width="100%" height={150}>
+                <PieChart>
+                  <Pie
+                    data={typeBreakdown}
+                    cx="50%"
+                    cy="50%"
+                    innerRadius={40}
+                    outerRadius={60}
+                    dataKey="count"
+                    stroke="none"
+                  >
+                    {typeBreakdown.map((_, i) => (
+                      <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    contentStyle={{
+                      background: 'var(--card-bg)',
+                      border: '1px solid var(--border-stronger)',
+                      borderRadius: 12,
+                      fontSize: 12
+                    }}
+                    formatter={(value) => [Number(value), t('overview.tooltipScans')]}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="mt-2 space-y-1.5">
+                {typeBreakdown.map((item, i) => (
+                  <div key={item.name} className="flex items-center gap-2">
+                    <div
+                      className="h-2.5 w-2.5 rounded-full"
+                      style={{ background: PIE_COLORS[i % PIE_COLORS.length] }}
+                    />
+                    <span className="flex-1 text-[12px] text-zinc-400">{item.name}</span>
+                    <span className="font-mono text-[11px]" style={{ color: 'var(--text-muted)' }}>
+                      {item.count}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div
+              className="flex h-[200px] items-center justify-center text-[13px]"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {t('overview.noData')}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Charts row 2 — Bar charts */}
+      <div className="mb-5 grid grid-cols-2 gap-4">
+        {/* Category breakdown */}
+        <div
+          className="rounded-2xl p-5"
+          style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+        >
+          <h3
+            className="mb-4 text-[12px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            {t('overview.topCategoriesBySpace')}
+          </h3>
+          {categoryBreakdown.length > 0 ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={categoryBreakdown} layout="vertical" barSize={14}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--grid-line)" horizontal={false} />
+                <XAxis
+                  type="number"
+                  tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                  tickFormatter={(v) => formatBytes(v, 0)}
+                />
+                <YAxis
+                  type="category"
+                  dataKey="name"
+                  tick={{ fill: 'var(--text-secondary)', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                  width={90}
+                />
+                <Tooltip
+                  contentStyle={{
+                    background: 'var(--card-bg)',
+                    border: '1px solid var(--border-stronger)',
+                    borderRadius: 12,
+                    fontSize: 12
+                  }}
+                  formatter={(value) => [formatBytes(Number(value)), t('overview.tooltipSpace')]}
+                />
+                <Bar dataKey="space" radius={[0, 6, 6, 0]}>
+                  {categoryBreakdown.map((_, i) => (
+                    <Cell key={i} fill={PIE_COLORS[i % PIE_COLORS.length]} fillOpacity={0.8} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div
+              className="flex h-[220px] items-center justify-center text-[13px]"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {t('overview.noCategoryData')}
+            </div>
+          )}
+        </div>
+
+        {/* Weekly trend */}
+        <div
+          className="rounded-2xl p-5"
+          style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+        >
+          <h3
+            className="mb-4 text-[12px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            {t('overview.weeklyActivity')}
+          </h3>
+          {weeklyData.length > 1 ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={weeklyData} barSize={20}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--grid-line)" />
+                <XAxis
+                  dataKey="week"
+                  tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <YAxis
+                  tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <Tooltip
+                  contentStyle={{
+                    background: 'var(--card-bg)',
+                    border: '1px solid var(--border-stronger)',
+                    borderRadius: 12,
+                    fontSize: 12
+                  }}
+                  labelStyle={{ color: 'var(--text-secondary)' }}
+                  formatter={(value, name) => [
+                    name === 'count' ? Number(value) : formatBytes(Number(value)),
+                    name === 'count' ? t('overview.tooltipScans') : t('overview.tooltipSpace')
+                  ]}
+                />
+                <Bar dataKey="count" fill="#3b82f6" radius={[4, 4, 0, 0]} fillOpacity={0.8} />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div
+              className="flex h-[220px] items-center justify-center text-[13px]"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {t('overview.needTwoWeeksData')}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Recent 5 scans summary */}
+      <div
+        className="rounded-2xl p-5"
+        style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+      >
+        <h3
+          className="mb-4 text-[12px] font-medium uppercase tracking-wider"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          {t('overview.recentScans')}
+        </h3>
+        <div className="space-y-2">
+          {entries.slice(0, 5).map((entry) => (
+            <RecentScanRow key={entry.id} entry={entry} />
+          ))}
+        </div>
+      </div>
+    </>
+  )
+}
+
+// ============ Timeline View ============
+
+function TimelineView({
+  entries,
+  typeFilter,
+  setTypeFilter,
+  selectedEntry,
+  setSelectedEntry,
+  typeConfig
+}: {
+  entries: ScanHistoryEntry[]
+  typeFilter: 'all' | ScanHistoryEntry['type']
+  setTypeFilter: (f: 'all' | ScanHistoryEntry['type']) => void
+  selectedEntry: string | null
+  setSelectedEntry: (id: string | null) => void
+  typeConfig: Record<
+    HistoryEntryType,
+    { label: string; icon: typeof Sparkles; color: string; bg: string }
+  >
+}) {
+  const { t } = useTranslation('history')
+  const { features } = usePlatform()
+  const filters: { label: string; value: 'all' | ScanHistoryEntry['type'] }[] = [
+    { label: t('timeline.filterAll'), value: 'all' },
+    { label: t('timeline.filterCleaner'), value: 'cleaner' },
+    ...(features.registry
+      ? [{ label: t('timeline.filterRegistry'), value: 'registry' as const }]
+      : []),
+    ...(features.debloater
+      ? [{ label: t('timeline.filterDebloater'), value: 'debloater' as const }]
+      : []),
+    { label: t('timeline.filterNetwork'), value: 'network' },
+    ...(features.drivers
+      ? [{ label: t('timeline.filterDrivers'), value: 'drivers' as const }]
+      : []),
+    { label: t('timeline.filterMalware'), value: 'malware' },
+    { label: t('timeline.filterPrivacy'), value: 'privacy' },
+    { label: t('timeline.filterStartup'), value: 'startup' },
+    { label: t('timeline.filterServices'), value: 'services' },
+    { label: t('timeline.filterUpdates'), value: 'software-update' }
+  ]
+
+  const detail = entries.find((e) => e.id === selectedEntry) || null
+
+  return (
+    <>
+      {/* Filter pills */}
+      <div className="mb-4 flex items-center gap-2">
+        {filters.map((f) => (
+          <button
+            key={f.value}
+            onClick={() => setTypeFilter(f.value)}
+            className="rounded-full px-3.5 py-1.5 text-[12px] font-medium transition-colors"
+            style={{
+              background: typeFilter === f.value ? 'var(--accent-muted-bg)' : 'var(--bg-subtle-2)',
+              color: typeFilter === f.value ? 'var(--accent)' : 'var(--text-muted)'
+            }}
+          >
+            {f.label}
+          </button>
+        ))}
+        <span className="ml-auto text-[12px] font-mono" style={{ color: 'var(--text-muted)' }}>
+          {t('timeline.entriesCount', { count: entries.length })}
+        </span>
+      </div>
+
+      {/* Table */}
+      <div
+        className="overflow-hidden rounded-2xl"
+        style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+      >
+        <table className="w-full">
+          <thead>
+            <tr style={{ borderBottom: '1px solid var(--border-medium)' }}>
+              <th
+                className="px-5 py-3 text-left text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {t('timeline.columnType')}
+              </th>
+              <th
+                className="px-4 py-3 text-left text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {t('timeline.columnDate')}
+              </th>
+              <th
+                className="px-4 py-3 text-right text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {t('timeline.columnItems')}
+              </th>
+              <th
+                className="px-4 py-3 text-right text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {t('timeline.columnSpace')}
+              </th>
+              <th
+                className="px-4 py-3 text-right text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {t('timeline.columnDuration')}
+              </th>
+              <th
+                className="px-4 py-3 text-center text-[11px] font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-muted)' }}
+              >
+                {t('timeline.columnStatus')}
+              </th>
+              <th className="w-10 px-4 py-3" />
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map((entry) => {
+              const config = typeConfig[entry.type]
+              const Icon = config.icon
+              return (
+                <tr
+                  key={entry.id}
+                  className="cursor-pointer transition-colors"
+                  style={{ borderBottom: '1px solid var(--bg-subtle)' }}
+                  onClick={() => setSelectedEntry(entry.id)}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = 'var(--bg-subtle)'
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = 'transparent'
+                  }}
+                >
+                  <td className="px-5 py-3">
+                    <div className="flex items-center gap-2.5">
+                      <div
+                        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg"
+                        style={{ background: config.bg }}
+                      >
+                        <Icon
+                          className="h-3.5 w-3.5"
+                          style={{ color: config.color }}
+                          strokeWidth={1.8}
+                        />
+                      </div>
+                      <span className="text-[12.5px] font-medium text-zinc-200">
+                        {config.label}
+                      </span>
+                      {entry.scheduled && (
+                        <span
+                          className="rounded-full px-1.5 py-0.5 text-[9px] font-medium"
+                          style={{ background: 'rgba(99,102,241,0.1)', color: '#818cf8' }}
+                        >
+                          {t('timeline.scheduledBadge')}
+                        </span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+                    {new Date(entry.timestamp).toLocaleDateString(undefined, {
+                      month: 'short',
+                      day: 'numeric',
+                      year: 'numeric'
+                    })}
+                    <span className="ml-1.5" style={{ color: 'var(--text-muted)' }}>
+                      {new Date(entry.timestamp).toLocaleTimeString(undefined, {
+                        hour: '2-digit',
+                        minute: '2-digit'
+                      })}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-right font-mono text-[12px] text-zinc-300">
+                    {entry.totalItemsCleaned.toLocaleString()}
+                  </td>
+                  <td
+                    className="px-4 py-3 text-right font-mono text-[12px]"
+                    style={{ color: entry.totalSpaceSaved > 0 ? '#22c55e' : 'var(--text-muted)' }}
+                  >
+                    {entry.totalSpaceSaved > 0 ? formatBytes(entry.totalSpaceSaved) : '—'}
+                  </td>
+                  <td
+                    className="px-4 py-3 text-right font-mono text-[12px]"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    {formatDuration(entry.duration, t)}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    {entry.errorCount > 0 ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                        style={{ background: 'rgba(239,68,68,0.1)', color: '#ef4444' }}
+                      >
+                        <AlertCircle className="h-3 w-3" strokeWidth={2} />
+                        {entry.errorCount}
+                      </span>
+                    ) : (
+                      <CheckCircle2
+                        className="inline h-4 w-4"
+                        style={{ color: '#22c55e' }}
+                        strokeWidth={1.8}
+                      />
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <Info
+                      className="inline h-3.5 w-3.5"
+                      style={{ color: 'var(--text-muted)' }}
+                      strokeWidth={1.8}
+                    />
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+
+        {entries.length === 0 && (
+          <div className="py-12 text-center text-[13px]" style={{ color: 'var(--text-muted)' }}>
+            {t('timeline.noEntriesMatchFilter')}
+          </div>
+        )}
+      </div>
+
+      {/* Detail popup */}
+      {detail && <ScanDetailPopup entry={detail} onClose={() => setSelectedEntry(null)} />}
+    </>
+  )
+}
+
+// ============ Scan Detail Popup ============
+
+function ScanDetailPopup({ entry, onClose }: { entry: ScanHistoryEntry; onClose: () => void }) {
+  const { t } = useTranslation('history')
+  const typeConfig = useTypeConfig()
+  const config = typeConfig[entry.type]
+  const Icon = config.icon
+
+  return (
+    <div className="fixed inset-0 z-[100] flex items-center justify-center">
+      <div
+        className="absolute inset-0"
+        style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }}
+        onClick={onClose}
+      />
+      <div
+        className="relative max-h-[85vh] w-full max-w-2xl overflow-y-auto animate-scale-in rounded-2xl p-6"
+        style={{
+          background: 'var(--card-bg)',
+          border: '1px solid var(--border-medium)',
+          boxShadow: '0 24px 80px rgba(0,0,0,0.5)'
+        }}
+      >
+        {/* Header */}
+        <div className="mb-5 flex items-center gap-3">
+          <div
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl"
+            style={{ background: config.bg }}
+          >
+            <Icon className="h-5 w-5" style={{ color: config.color }} strokeWidth={1.8} />
+          </div>
+          <div className="flex-1">
+            <h3 className="text-[15px] font-semibold text-white">{config.label}</h3>
+            <p className="text-[12px]" style={{ color: 'var(--text-muted)' }}>
+              {new Date(entry.timestamp).toLocaleDateString(undefined, {
+                weekday: 'short',
+                month: 'short',
+                day: 'numeric',
+                year: 'numeric'
+              })}
+              {' ' + t('timeline.dateAt') + ' '}
+              {new Date(entry.timestamp).toLocaleTimeString(undefined, {
+                hour: '2-digit',
+                minute: '2-digit'
+              })}
+              {entry.scheduled && (
+                <span
+                  className="ml-2 rounded-full px-2 py-0.5 text-[10px] font-medium"
+                  style={{ background: 'rgba(99,102,241,0.1)', color: '#818cf8' }}
+                >
+                  {t('detail.scheduledBadge')}
+                </span>
+              )}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-lg transition-colors"
+            style={{ color: 'var(--text-muted)' }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'var(--bg-hover-2)'
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'transparent'
+            }}
+          >
+            <XCircle className="h-4 w-4" strokeWidth={1.8} />
+          </button>
+        </div>
+
+        {/* Stats grid */}
+        <div className="mb-5 grid grid-cols-4 gap-2.5">
+          <DetailStat
+            label={t('detail.statFound')}
+            value={entry.totalItemsFound.toLocaleString()}
+          />
+          <DetailStat
+            label={t('detail.statProcessed')}
+            value={entry.totalItemsCleaned.toLocaleString()}
+          />
+          <DetailStat
+            label={t('detail.statSkipped')}
+            value={entry.totalItemsSkipped.toLocaleString()}
+          />
+          <DetailStat
+            label={t('detail.statSpaceSaved')}
+            value={entry.totalSpaceSaved > 0 ? formatBytes(entry.totalSpaceSaved) : '—'}
+          />
+        </div>
+
+        {/* Duration & errors */}
+        <div className="mb-5 flex items-center gap-4">
+          <div
+            className="flex items-center gap-1.5 text-[12px]"
+            style={{ color: 'var(--text-muted)' }}
+          >
+            <Clock className="h-3.5 w-3.5" strokeWidth={1.6} />
+            {formatDuration(entry.duration, t)}
+          </div>
+          {entry.errorCount > 0 && (
+            <div className="flex items-center gap-1.5 text-[12px]" style={{ color: '#ef4444' }}>
+              <AlertCircle className="h-3.5 w-3.5" strokeWidth={1.8} />
+              {entry.errorCount !== 1
+                ? t('detail.errorCountPlural', { count: entry.errorCount })
+                : t('detail.errorCount', { count: entry.errorCount })}
+            </div>
+          )}
+        </div>
+
+        {/* Category breakdown */}
+        {entry.categories.length > 0 && (
+          <div>
+            <h4
+              className="mb-3 text-[11px] font-medium uppercase tracking-wider"
+              style={{ color: 'var(--text-muted)' }}
+            >
+              {t('detail.categoriesLabel')}
+            </h4>
+            <div
+              className="space-y-2 max-h-48 overflow-y-auto pr-1"
+              style={{ scrollbarWidth: 'thin' }}
+            >
+              {entry.categories.map((cat, i) => {
+                const maxItems = Math.max(...entry.categories.map((c) => c.itemsCleaned), 1)
+                const percent = (cat.itemsCleaned / maxItems) * 100
+                return (
+                  <div key={cat.name} className="flex items-center gap-3">
+                    <span className="w-24 shrink-0 truncate text-[12px] capitalize text-zinc-400">
+                      {cat.name}
+                    </span>
+                    <div
+                      className="flex-1 h-[6px] rounded-full overflow-hidden"
+                      style={{ background: 'var(--bg-subtle-2)' }}
+                    >
+                      <div
+                        className="h-full rounded-full"
+                        style={{
+                          width: `${percent}%`,
+                          background: PIE_COLORS[i % PIE_COLORS.length],
+                          opacity: 0.8
+                        }}
+                      />
+                    </div>
+                    <span
+                      className="w-14 shrink-0 text-right font-mono text-[11px]"
+                      style={{ color: 'var(--text-muted)' }}
+                    >
+                      {cat.itemsCleaned}
+                    </span>
+                    {cat.spaceSaved > 0 && (
+                      <span
+                        className="w-18 shrink-0 text-right font-mono text-[11px]"
+                        style={{ color: 'var(--text-muted)' }}
+                      >
+                        {formatBytes(cat.spaceSaved)}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        )}
+
+        {entry.cleanedFrom && entry.cleanedTo && (
+          <DeletedFilesSection from={entry.cleanedFrom} to={entry.cleanedTo} />
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ============ Deleted Files (deletion log) ============
+
+const DELETED_FILES_PAGE = 200
+
+/**
+ * The individual paths a clean removed, read from the deletion log by the time
+ * window the history entry recorded. Loaded lazily and paged — a single run can
+ * hold six figures of paths, so nothing is fetched until the popup opens.
+ */
+function DeletedFilesSection({ from, to }: { from: string; to: string }) {
+  const { t } = useTranslation('history')
+  const [records, setRecords] = useState<DeletedFileRecord[]>([])
+  const [total, setTotal] = useState(0)
+  const [enabled, setEnabled] = useState(true)
+  const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [exporting, setExporting] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    window.atlas
+      .deletionLogQuery({ from, to, origin: 'local', offset: 0, limit: DELETED_FILES_PAGE })
+      .then((page) => {
+        if (cancelled) return
+        setRecords(page.records)
+        setTotal(page.total)
+        setEnabled(page.enabled)
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setRecords([])
+          setTotal(0)
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [from, to])
+
+  const loadMore = async () => {
+    setLoadingMore(true)
+    try {
+      const page = await window.atlas.deletionLogQuery({
+        from,
+        to,
+        origin: 'local',
+        offset: records.length,
+        limit: DELETED_FILES_PAGE
+      })
+      setRecords((prev) => [...prev, ...page.records])
+      setTotal(page.total)
+    } catch {
+      // Leave what we already have on screen
+    }
+    setLoadingMore(false)
+  }
+
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      const savedTo = await window.atlas.deletionLogExport({ from, to, origin: 'local' })
+      if (savedTo) toast.success(t('detail.deletedFiles.exported', { count: total }))
+    } catch {
+      toast.error(t('detail.deletedFiles.exportFailed'))
+    }
+    setExporting(false)
+  }
+
+  return (
+    <div className="mt-5 border-t pt-5" style={{ borderColor: 'var(--border-default)' }}>
+      <div className="mb-3 flex items-center gap-2">
+        <h4
+          className="text-[11px] font-medium uppercase tracking-wider"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          {t('detail.deletedFiles.title')}
+        </h4>
+        {total > 0 && (
+          <span className="font-mono text-[11px]" style={{ color: 'var(--text-muted)' }}>
+            {t('detail.deletedFiles.shownCount', { shown: records.length, total })}
+          </span>
+        )}
+        {total > 0 && (
+          <div className="ml-auto flex items-center gap-1.5">
+            <IconButton
+              icon={Download}
+              label={t('detail.deletedFiles.exportCsv')}
+              onClick={handleExport}
+              disabled={exporting}
+            />
+            <IconButton
+              icon={FolderOpen}
+              label={t('detail.deletedFiles.openLog')}
+              onClick={() => window.atlas.deletionLogReveal()}
+            />
+          </div>
+        )}
+      </div>
+
+      {loading ? (
+        <p className="py-3 text-[12px]" style={{ color: 'var(--text-muted)' }}>
+          {t('detail.deletedFiles.loading')}
+        </p>
+      ) : records.length === 0 ? (
+        <div
+          className="flex items-start gap-2.5 rounded-xl p-3.5"
+          style={{ background: 'var(--bg-subtle)' }}
+        >
+          <FileText
+            className="mt-0.5 h-4 w-4 shrink-0"
+            style={{ color: 'var(--text-muted)' }}
+            strokeWidth={1.6}
+          />
+          <p className="text-[12px] leading-relaxed" style={{ color: 'var(--text-muted)' }}>
+            {enabled
+              ? t('detail.deletedFiles.emptyRecorded')
+              : t('detail.deletedFiles.disabledHint')}
+          </p>
+        </div>
+      ) : (
+        <>
+          <div
+            className="max-h-64 overflow-y-auto rounded-xl"
+            style={{ background: 'var(--bg-subtle)', scrollbarWidth: 'thin' }}
+          >
+            {records.map((r, i) => (
+              <div
+                key={`${r.ts}-${r.path}-${i}`}
+                className="flex items-center gap-3 px-3 py-1.5"
+                style={{
+                  borderBottom: i < records.length - 1 ? '1px solid var(--bg-subtle-2)' : undefined
+                }}
+              >
+                {/* dir=rtl moves the ellipsis to the start so the file name — the
+                    part that answers "what did it delete?" — stays visible. The
+                    <bdi> keeps the path itself rendering left-to-right. */}
+                <span
+                  className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-zinc-300"
+                  title={r.path}
+                  dir="rtl"
+                >
+                  <bdi>{r.path}</bdi>
+                </span>
+                {r.truncated ? (
+                  <span
+                    className="shrink-0 rounded-full px-1.5 py-0.5 text-[9.5px] font-medium"
+                    style={{ background: 'rgba(245,158,11,0.1)', color: '#f59e0b' }}
+                    title={t('detail.deletedFiles.truncatedHint', { count: r.truncated })}
+                  >
+                    {t('detail.deletedFiles.truncatedBadge', { count: r.truncated })}
+                  </span>
+                ) : r.category ? (
+                  <span
+                    className="shrink-0 text-[10.5px] capitalize"
+                    style={{ color: 'var(--text-muted)' }}
+                  >
+                    {r.category}
+                  </span>
+                ) : null}
+                <span
+                  className="w-16 shrink-0 text-right font-mono text-[11px]"
+                  style={{ color: 'var(--text-muted)' }}
+                >
+                  {r.size > 0 ? formatBytes(r.size) : '—'}
+                </span>
+              </div>
+            ))}
+          </div>
+          {records.length < total && (
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="mt-2 w-full rounded-xl py-2 text-[12px] font-medium transition-colors disabled:opacity-50"
+              style={{ background: 'var(--bg-subtle-2)', color: 'var(--text-secondary)' }}
+            >
+              {loadingMore ? t('detail.deletedFiles.loading') : t('detail.deletedFiles.loadMore')}
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function IconButton({
+  icon: Icon,
+  label,
+  onClick,
+  disabled
+}: {
+  icon: typeof Download
+  label: string
+  onClick: () => void
+  disabled?: boolean
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      title={label}
+      className="flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-medium transition-colors disabled:opacity-50"
+      style={{ background: 'var(--bg-subtle-2)', color: 'var(--text-muted)' }}
+    >
+      <Icon className="h-3.5 w-3.5" strokeWidth={1.7} />
+      {label}
+    </button>
+  )
+}
+
+// ============ Shared Components ============
+
+function MiniStat({
+  icon: Icon,
+  label,
+  value,
+  color
+}: {
+  icon: typeof BarChart3
+  label: string
+  value: string
+  color: string
+}) {
+  return (
+    <div
+      className="rounded-2xl p-4"
+      style={{ background: 'var(--card-bg)', border: '1px solid var(--border-default)' }}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <Icon className="h-4 w-4" style={{ color }} strokeWidth={1.8} />
+        <span
+          className="text-[11px] font-medium uppercase tracking-wider"
+          style={{ color: 'var(--text-muted)' }}
+        >
+          {label}
+        </span>
+      </div>
+      <span className="text-[20px] font-bold tracking-tight text-zinc-100">{value}</span>
+    </div>
+  )
+}
+
+function DetailStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-xl p-3" style={{ background: 'var(--bg-subtle)' }}>
+      <p
+        className="text-[10px] font-medium uppercase tracking-wider"
+        style={{ color: 'var(--text-muted)' }}
+      >
+        {label}
+      </p>
+      <p className="mt-1 text-[16px] font-semibold text-zinc-200">{value}</p>
+    </div>
+  )
+}
+
+function RecentScanRow({ entry }: { entry: ScanHistoryEntry }) {
+  const { t } = useTranslation('history')
+  const typeConfig = useTypeConfig()
+  const config = typeConfig[entry.type]
+  const Icon = config.icon
+
+  return (
+    <div
+      className="flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors"
+      style={{ background: 'var(--bg-subtle)' }}
+    >
+      <div
+        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg"
+        style={{ background: config.bg }}
+      >
+        <Icon className="h-4 w-4" style={{ color: config.color }} strokeWidth={1.8} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <span className="text-[12px] font-medium text-zinc-300">{config.label}</span>
+        <p className="text-[11px]" style={{ color: 'var(--text-muted)' }}>
+          {entry.totalItemsCleaned.toLocaleString()} {t('detail.itemsSuffix')}
+          {entry.totalSpaceSaved > 0 && ` · ${formatBytes(entry.totalSpaceSaved)}`}
+        </p>
+      </div>
+      <span className="shrink-0 text-[11px]" style={{ color: 'var(--text-muted)' }}>
+        {new Date(entry.timestamp).toLocaleDateString(undefined, {
+          month: 'short',
+          day: 'numeric'
+        })}
+      </span>
+    </div>
+  )
+}
+
+function formatDuration(
+  ms: number,
+  t?: (key: string, opts?: Record<string, unknown>) => string
+): string {
+  if (ms < 1000) return t ? t('duration.lessThanOneSecond') : '<1s'
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 60) return t ? t('duration.seconds', { count: seconds }) : `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  const secs = seconds % 60
+  return t ? t('duration.minutesAndSeconds', { minutes, seconds: secs }) : `${minutes}m ${secs}s`
+}

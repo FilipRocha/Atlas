@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Avslutt",
+  "scheduledTaskNotificationTitle": "Atlas - Planlagt oppgave",
+  "scheduledTaskNotificationBody": "Kjører \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Skanning fullført",
+  "scanCompleteNotificationBody": "Fant {{itemCount}} elementer ({{sizeMB}} MB) som kan ryddes.",
+  "scheduledScanName": "Planlagt skanning",
+  "openAtlas": "Åpne Atlas"
+}

@@ -1,0 +1,10 @@
+{
+  "trayTooltip": "Atlas",
+  "quit": "Quitter",
+  "scheduledTaskNotificationTitle": "Atlas - Tâche planifiée",
+  "scheduledTaskNotificationBody": "Exécution de \\\"{{name}}\\\"...",
+  "scanCompleteNotificationTitle": "Atlas - Analyse terminée",
+  "scanCompleteNotificationBody": "{{itemCount}} éléments trouvés ({{sizeMB}} Mo) pouvant être nettoyés.",
+  "scheduledScanName": "Analyse planifiée",
+  "openAtlas": "Ouvrir Atlas"
+}
